@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Handoff: IDApTIK #188 — the synth diversion and the canonical noise seam
+
+Status:: fix authored, parse-checked, *not* compiled and *not* pushed upstream (see
+"Verification" and "Why this lives here").
+
+== Where the issue actually stands
+
+The issue reports two observation failures in
+`cargo test -p idaptik-evil-weevil --test corpus` (scenario
+`EW-06-infrastructure-orders-and-observations`) and lists three options. Reading
+`IDApTIK@main` (commit `ed02ea5`, 2026-11-01):
+
+* **Geometry (finding 1) — already repaired upstream.** `ae6125e` (#190) and
+  `4c86daa` (#203) rewrote `crates/idaptik-evil-weevil/src/scenarios/infra_orders.rs`:
+  the run now shadows the deterministic sim to learn where Billy actually is at
+  `SYNTH_AT`, walks the mole into the intersection of his 260-unit hearing radius
+  and the mole's reachable range, and refuses to run with a degenerate corridor.
+* **Phase (finding 2) — already repaired upstream.** `system_infra_watch`
+  (`crates/idaptik-core/src/scenario/sim/infra.rs`) no longer asserts
+  `Phase::Crisis`; its gate is Billy's *presence* (`mode != Offsite`), which is
+  the one thing `begin_crisis` sets alongside the phase. Its own doc comment
+  records why the conjunction was dropped.
+* **The seam (finding 3) — still true on `main`.** `infra::noise_sources()`, the
+  pure "definition + canonical state" seam, read water zones and alarms only.
+  The running diversion lives in `RuntimeState::diversion` but was appended by
+  the hosting seam (`GhostLobbySim::extra_noise()`), *after* `noise_sources()`.
+  So the sim heard the diversion and a caller of the canonical seam did not: a
+  replay, a resync, or a frontend reconstructing the run from the snapshot got a
+  different answer from the seat that was running.
+
+== The change (option A)
+
+Option A in the issue — "move the diversion into `noise_sources()` and drop that
+half of `extra_noise()`", described there as independent of EW-06 and worth
+doing either way. It is the elegant default under the estate doctrine: the
+canonical seam becomes a complete function of `(definition, state)` instead of
+being completed by whichever host happened to be ticking.
+
+* `crates/idaptik-core/src/scenario/infra.rs`
+  ** `noise_sources()` reports a running diversion (`state.diversion`, `t > 0`,
+  `UnusualNoise`, `d.intensity`) from its own position. The infra early-return
+  is gone, because a diversion can exist on a floor with no `InfraDef` at all —
+  it is companion state, not plumbing.
+  ** The source keeps its old position in the list (after water/alarm sources),
+  so ordering, the strongest-heard tie-break in `infra_investigation_target`
+  and every existing golden are unchanged.
+  ** `room_at_or_last()` is lifted out of `sim/infra.rs` into this module, so
+  the pure seam and the sim resolve a noise source's room by the same rule.
+  ** The expired-window test stays (`t > 0`): a restored snapshot may still
+  carry a spent record.
+* `crates/idaptik-core/src/scenario/sim/infra.rs`
+  ** `extra_noise()` now carries only what canonical `RuntimeState` cannot hold —
+  the mole's digging and chewing, which lives in the companion runtime. Its doc
+  comment says so and names where the diversion went.
+* Tests
+  ** `tests/infra_boundaries.rs`: new
+  `a_running_diversion_is_noise_in_canonical_state_until_its_window_ends` — the
+  diversion is a noise source, `observations(.., &[])` hears it with no host
+  help, a floor with `infra = None` still sounds, and an expired window is
+  silent.
+  ** `tests/infra_observations.rs`: `guard_notices_survive_restore_and_an_ended_
+  episode_can_be_noticed_again` now also asserts that `noise_sources()` and the
+  running seat's `actor_observations()` agree on the restored diversion — the
+  regression the issue describes.
+
+Not changed, deliberately: the mole's digging/chewing noise stays host-supplied
+(it is not in `RuntimeState`), and `observation` order, hearing gates and goldens
+are untouched.
+
+== Verification — read this before merging
+
+Checked::
+
+* All four touched files parse cleanly (tree-sitter Rust grammar).
+* The change was reasoned line by line against the existing code; ordering and
+  the hearing gate are preserved by construction.
+
+Not checked:: This sandbox has **no Rust toolchain** (`cargo` is
+absent; `static.rust-lang.org` and `crates.io` are unreachable from here, and the
+only prebuilt compiler reachable — an npm-hosted 1.88 `rustc` — cannot build the
+workspace without its crates). So `cargo fmt`, `cargo clippy -D warnings`,
+`cargo test -p idaptik-core`, `just test-ghost` and `just evil-weevil-check`
+were **not** run, and no claim is made that they pass. Apply the patch and run
+the gates before merging; that is the outstanding step.
+
+== Why this lives here
+
+The issue is in `catachresis-colloquium/IDApTIK`; this session's checkout is
+`catachresis-colloquium/evil-weevil`, and the sandbox's GitHub credentials are
+read-only for `IDApTIK` (`git push` → `403 Permission to
+catachresis-colloquium/IDApTIK.git denied`, and the API returns "Resource not
+accessible by integration" for a write). The fix could therefore not be pushed
+or opened as a pull request upstream from here.
+
+Apply it with:
+
+[source,shell]
+----
+cd IDApTIK                       # at or after ed02ea5
+git am /path/to/0001-fix-core-report-a-running-diversion-from-the-canonical-noise-seam.patch
+just test-ghost && just evil-weevil-check
+----
+
+Then open the pull request against `IDApTIK` referencing #188. The patch's
+message records the reasoning; the author line is `Arena Agent
+<agent@arena.ai>` and it is **unsigned** (no signing key in this sandbox) — re-sign
+on rebase or `git commit --amend -S` before pushing, per the estate's signing
+rule.

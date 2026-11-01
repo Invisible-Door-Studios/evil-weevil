@@ -1,0 +1,363 @@
+From e5114bd8e41f70ce5b6dd98b4d0af390c9231e9b Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 1 Nov 2026 23:13:49 +0000
+Subject: [PATCH] fix(core): report a running diversion from the canonical
+ noise seam (#188)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The synth diversion is canonical state (RuntimeState::diversion), but
+noise_sources() — the pure definition+state seam that observations() is
+built on — did not read it. The hosting seam in sim appended it instead,
+so a replay or resync reconstructing a run from the snapshot and asking
+the canonical seam directly got a different answer from the seat that was
+running: the sim heard the diversion, the seam did not.
+
+Read the diversion in noise_sources() and drop it from the sim's
+extra_noise(), which now carries only noise canonical state does not hold
+(the mole's digging and chewing). The diversion keeps its position after
+the infrastructure sources, so ordering, investigation tie-breaks and
+existing goldens are unchanged, and it is still gated by an unexpired
+window because a restored snapshot may carry a spent record.
+
+Also lift the sim's room_at_or_last() helper into the pure module, so the
+seam and the sim resolve a noise source's room identically.
+
+Addresses the seam half of EW-06 (option A in the issue); the scenario's
+geometry and phase half was already repaired on main by #190/#203.
+---
+ crates/idaptik-core/src/scenario/infra.rs     | 125 ++++++++++++------
+ crates/idaptik-core/src/scenario/sim/infra.rs |  38 ++----
+ crates/idaptik-core/tests/infra_boundaries.rs |  55 ++++++++
+ .../idaptik-core/tests/infra_observations.rs  |  17 ++-
+ 4 files changed, 164 insertions(+), 71 deletions(-)
+
+diff --git a/crates/idaptik-core/src/scenario/infra.rs b/crates/idaptik-core/src/scenario/infra.rs
+index 9739133..c2f4fa8 100644
+--- a/crates/idaptik-core/src/scenario/infra.rs
++++ b/crates/idaptik-core/src/scenario/infra.rs
+@@ -41,7 +41,9 @@
+ //!   ([`observations`]), gated by room and by the actor's own hearing stats.
+ //! * [`NoiseSource`] / [`noise_sources`] — where the floor is making noise
+ //!   right now, independent of who can hear it; the observation gate decides
+-//!   who hears.
++//!   who hears. Canonical state is the whole input: plumbing, electrics,
++//!   alarms, and a running diversion all sound from here, so the pure seam
++//!   and the running tick cannot disagree about what is audible.
+ //!
+ //! # Evil Weevil adapter
+ //!
+@@ -338,50 +340,72 @@ pub fn wade_noise(def: &ScenarioDefinition, state: &RuntimeState, x: f64) -> f64
+     }
+ }
+ 
+-/// Every noise the infrastructure is making this tick, in definition order:
+-/// zones still filling splash, shorted rooms spark for their flash window,
+-/// sounding alarms ring floor-wide. Mole-made noise is added by the hosting
+-/// seam in [`crate::scenario::sim`], not here — this function reads canonical
+-/// infrastructure state only.
++/// Every noise the floor is making this tick, in definition order: zones
++/// still filling splash, shorted rooms spark for their flash window, sounding
++/// alarms ring floor-wide, and a running diversion (the hosted mole's synth
++/// decoy) sounds from where it was played. Everything read here is canonical
++/// state — the same state a snapshot, replay or resync restores — so this
++/// function and the actor running the tick agree on what is audible.
++///
++/// A diversion belongs here rather than in the hosting seam
++/// ([`crate::scenario::sim`]): it is in [`RuntimeState::diversion`], it can
++/// exist on a floor with no [`InfraDef`] at all, and it used to be appended by
++/// the sim *after* this function — so a caller reconstructing the run from a
++/// snapshot and asking this seam got a different answer from the seat that was
++/// running. Noise the sim owns and this state does not (the mole's digging and
++/// chewing, which live in the companion runtime) is still supplied by the host.
+ pub fn noise_sources(def: &ScenarioDefinition, state: &RuntimeState) -> Vec<NoiseSource> {
+     let mut out = Vec::new();
+-    let (Some(infra_def), Some(infra)) = (def.infra.as_ref(), state.infra.as_ref()) else {
+-        return out;
+-    };
+-    for zone in &infra_def.water_zones {
+-        let Some(z) = infra.zones.get(zone.id.as_str()) else {
+-            continue;
+-        };
+-        if !z.released {
+-            continue;
+-        }
+-        let x = room_centre(def, zone.room.as_str());
+-        if z.level < 1.0 {
+-            out.push(NoiseSource {
+-                x,
+-                room: zone.room.clone(),
+-                intensity: c::WATER_SPLASH_NOISE,
+-                kind: ObservationKind::UnusualNoise,
+-            });
++    if let (Some(infra_def), Some(infra)) = (def.infra.as_ref(), state.infra.as_ref()) {
++        for zone in &infra_def.water_zones {
++            let Some(z) = infra.zones.get(zone.id.as_str()) else {
++                continue;
++            };
++            if !z.released {
++                continue;
++            }
++            let x = room_centre(def, zone.room.as_str());
++            if z.level < 1.0 {
++                out.push(NoiseSource {
++                    x,
++                    room: zone.room.clone(),
++                    intensity: c::WATER_SPLASH_NOISE,
++                    kind: ObservationKind::UnusualNoise,
++                });
++            }
++            if z.short_flash > 0.0 {
++                out.push(NoiseSource {
++                    x,
++                    room: zone.room.clone(),
++                    intensity: c::SHORT_FLASH_NOISE,
++                    kind: ObservationKind::EquipmentFailure,
++                });
++            }
+         }
+-        if z.short_flash > 0.0 {
+-            out.push(NoiseSource {
+-                x,
+-                room: zone.room.clone(),
+-                intensity: c::SHORT_FLASH_NOISE,
+-                kind: ObservationKind::EquipmentFailure,
+-            });
++        for alarm in &infra_def.alarms {
++            if infra.alarms.get(alarm.id.as_str()).copied() == Some(true) {
++                out.push(NoiseSource {
++                    x: room_centre(def, alarm.room.as_str()),
++                    room: alarm.room.clone(),
++                    intensity: c::ALARM_NOISE,
++                    kind: ObservationKind::Alarm,
++                });
++            }
+         }
+     }
+-    for alarm in &infra_def.alarms {
+-        if infra.alarms.get(alarm.id.as_str()).copied() == Some(true) {
+-            out.push(NoiseSource {
+-                x: room_centre(def, alarm.room.as_str()),
+-                room: alarm.room.clone(),
+-                intensity: c::ALARM_NOISE,
+-                kind: ObservationKind::Alarm,
+-            });
+-        }
++    // A diversion whose window has run out is silent: the sim clears
++    // `state.diversion` on the next tick, but a restored snapshot may still
++    // carry the expired record, so the window is tested here rather than
++    // assumed.
++    if let Some(d) = &state.diversion
++        && d.t > 0.0
++    {
++        out.push(NoiseSource {
++            x: d.x,
++            room: room_at_or_last(def, d.x),
++            intensity: d.intensity,
++            kind: ObservationKind::UnusualNoise,
++        });
+     }
+     out
+ }
+@@ -404,8 +428,9 @@ pub struct Hearing {
+ ///   lit (a room authored dark is not an observation);
+ /// * water and equipment failure — the actor's own room (seen);
+ /// * noise, including sparking equipment and `extra_noise` supplied by the
+-///   host — sources strictly inside the hearing distance and strictly above
+-///   the loudness threshold (heard);
++///   host for what canonical state does not hold (the mole's digging) —
++///   sources strictly inside the hearing distance and strictly above the
++///   loudness threshold (heard);
+ /// * alarms — heard at any distance, but still strictly above the threshold.
+ ///
+ /// Returns room observations before heard sources, without deduplication;
+@@ -503,6 +528,22 @@ pub fn room_id_at(def: &ScenarioDefinition, x: f64) -> Option<&str> {
+         .map(|r| r.id.as_str())
+ }
+ 
++/// The room a body at world-x is judged to be in, as a [`RoomId`]: the same
++/// answer as [`room_id_at`], falling back to the last declared room and then
++/// to the empty room id when the definition declares no rooms at all. Used
++/// where an observation needs an owned room id and the definition may be
++/// degenerate.
++pub fn room_at_or_last(def: &ScenarioDefinition, x: f64) -> RoomId {
++    room_id_at(def, x)
++        .map(RoomId::from)
++        .unwrap_or_else(|| {
++            def.rooms
++                .last()
++                .map(|r| r.id.clone())
++                .unwrap_or_else(|| RoomId::from(""))
++        })
++}
++
+ fn is_zero(v: &f64) -> bool {
+     *v == 0.0
+ }
+diff --git a/crates/idaptik-core/src/scenario/sim/infra.rs b/crates/idaptik-core/src/scenario/sim/infra.rs
+index 58907d4..5833444 100644
+--- a/crates/idaptik-core/src/scenario/sim/infra.rs
++++ b/crates/idaptik-core/src/scenario/sim/infra.rs
+@@ -188,22 +188,17 @@ pub fn actor_observations(&self, at_x: f64) -> Vec<Observation> {
+         infra::observations(&self.def, &self.state, at_x, hearing, &self.extra_noise())
+     }
+ 
+-    /// Noise the hosted companion is making that the infrastructure layer
+-    /// does not own: the running synth diversion, and the mole's own digging
+-    /// and chewing. Canonical state only — the companion sim's runtime is
+-    /// part of the snapshot, so every seat agrees on the same noise.
++    /// Noise the hosted companion is making that canonical [`RuntimeState`]
++    /// does not own: the mole's own digging and chewing, which lives in the
++    /// companion runtime rather than the snapshot's state. Canonical state
++    /// only — the companion runtime is part of the snapshot, so every seat
++    /// agrees on the same noise.
++    ///
++    /// The synth diversion is *not* here: it is
++    /// [`RuntimeState::diversion`], so [`infra::noise_sources`] already
++    /// reports it and the pure seam and the running tick cannot disagree.
+     fn extra_noise(&self) -> Vec<NoiseSource> {
+         let mut out = Vec::new();
+-        if let Some(d) = &self.state.diversion
+-            && d.t > 0.0
+-        {
+-            out.push(NoiseSource {
+-                x: d.x,
+-                room: room_at_or_last(&self.def, d.x),
+-                intensity: d.intensity,
+-                kind: ObservationKind::UnusualNoise,
+-            });
+-        }
+         if let Some(mole) = &self.mole {
+             let ms = mole.state();
+             let busy = ms.alive
+@@ -215,7 +210,7 @@ fn extra_noise(&self) -> Vec<NoiseSource> {
+             if busy {
+                 out.push(NoiseSource {
+                     x: ms.x,
+-                    room: room_at_or_last(&self.def, ms.x),
++                    room: infra::room_at_or_last(&self.def, ms.x),
+                     intensity: c::MOLE_DIG_NOISE,
+                     kind: ObservationKind::UnusualNoise,
+                 });
+@@ -327,19 +322,6 @@ pub fn water_depth_at(&self, x: f64) -> Option<f64> {
+     }
+ }
+ 
+-/// The room a world-x falls in, or the last room — the simulation's own
+-/// fallback, expressed as data for a [`NoiseSource`].
+-fn room_at_or_last(def: &crate::scenario::definition::ScenarioDefinition, x: f64) -> RoomId {
+-    infra::room_id_at(def, x)
+-        .map(RoomId::from)
+-        .unwrap_or_else(|| {
+-            def.rooms
+-                .last()
+-                .map(|r| r.id.clone())
+-                .unwrap_or_else(|| RoomId::from(""))
+-        })
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/idaptik-core/tests/infra_boundaries.rs b/crates/idaptik-core/tests/infra_boundaries.rs
+index 91c571d..a11be8e 100644
+--- a/crates/idaptik-core/tests/infra_boundaries.rs
++++ b/crates/idaptik-core/tests/infra_boundaries.rs
+@@ -162,6 +162,61 @@ fn noise_stops_when_filling_and_sparking_finish_but_alarms_continue() {
+     assert_eq!(noise_sources(&def, &state), vec![sources[2].clone()]);
+ }
+ 
++#[test]
++fn a_running_diversion_is_noise_in_canonical_state_until_its_window_ends() {
++    use idaptik_core::scenario::state::DiversionState;
++
++    let (def, mut state) = fixture();
++    state.diversion = Some(DiversionState {
++        x: 430.0,
++        t: 2.0,
++        intensity: c::MOLE_SYNTH_NOISE,
++    });
++    let sources = noise_sources(&def, &state);
++    assert_eq!(sources.len(), 1);
++    assert_eq!(sources[0].x, 430.0);
++    assert_eq!(sources[0].kind, ObservationKind::UnusualNoise);
++    assert_eq!(sources[0].intensity, c::MOLE_SYNTH_NOISE);
++
++    // The pure seam alone hears it — no host-supplied `extra_noise` — so a
++    // caller reconstructing the run from a snapshot gets the answer the
++    // running seat gets.
++    let hearing = Hearing {
++        dist: c::NOISE_INVEST_DIST,
++        threshold: c::NOISE_INVEST_NOISE,
++    };
++    let heard = observations(&def, &state, 400.0, hearing, &[]);
++    assert!(
++        heard
++            .iter()
++            .any(|o| o.kind == ObservationKind::UnusualNoise && o.x == 430.0),
++        "a diversion 30 units away is audible: {heard:?}"
++    );
++
++    // The same diversion on a floor with no infrastructure at all still
++    // sounds: it is companion state, not plumbing.
++    let mut bare = def.clone();
++    bare.infra = None;
++    let mut bare_state = state.clone();
++    bare_state.infra = None;
++    assert_eq!(noise_sources(&bare, &bare_state).len(), 1);
++    assert!(
++        observations(&bare, &bare_state, 400.0, hearing, &[])
++            .iter()
++            .any(|o| o.kind == ObservationKind::UnusualNoise && o.x == 430.0)
++    );
++
++    // An expired window is silent even if a restored snapshot still carries
++    // the record.
++    state.diversion.as_mut().unwrap().t = 0.0;
++    assert!(noise_sources(&def, &state).is_empty());
++    assert!(
++        !observations(&def, &state, 400.0, hearing, &[])
++            .iter()
++            .any(|o| o.kind == ObservationKind::UnusualNoise)
++    );
++}
++
+ #[test]
+ fn hearing_requires_strictly_nearer_and_strictly_louder_sources() {
+     let (def, state) = fixture();
+diff --git a/crates/idaptik-core/tests/infra_observations.rs b/crates/idaptik-core/tests/infra_observations.rs
+index a20cf67..b420703 100644
+--- a/crates/idaptik-core/tests/infra_observations.rs
++++ b/crates/idaptik-core/tests/infra_observations.rs
+@@ -17,7 +17,7 @@
+ use idaptik_core::scenario::common::BillyMode;
+ use idaptik_core::scenario::event::Event;
+ use idaptik_core::scenario::floor_graph::{floor_graph, valve_node_id};
+-use idaptik_core::scenario::infra::ObservationKind;
++use idaptik_core::scenario::infra::{ObservationKind, noise_sources};
+ use idaptik_core::scenario::{GhostLobbySim, HALL_SUMP, RunConfig, ghost_lobby, pump_house};
+ 
+ #[test]
+@@ -114,6 +114,21 @@ fn guard_notices_survive_restore_and_an_ended_episode_can_be_noticed_again() {
+     };
+     snapshot.state.diversion = Some(diversion.clone());
+     let mut sim = GhostLobbySim::restore(def.clone(), snapshot).unwrap();
++    // The pure seam reads the same diversion the running tick hears: a
++    // caller reconstructing the run from this snapshot and asking
++    // `noise_sources` gets the noise the seat itself perceives.
++    assert!(
++        noise_sources(&def, sim.state())
++            .iter()
++            .any(|s| s.x == 430.0 && s.kind == ObservationKind::UnusualNoise),
++        "the canonical noise sources include the running diversion"
++    );
++    assert!(
++        sim.actor_observations(400.0)
++            .iter()
++            .any(|o| o.kind == ObservationKind::UnusualNoise && o.x == 430.0),
++        "and the running seat hears it from the same state"
++    );
+     let notice = Event::GuardObserved {
+         kind: ObservationKind::UnusualNoise,
+         room: "hall".into(),
