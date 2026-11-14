@@ -35,8 +35,10 @@ extern "C" {
 #endif
 
 #define EE_ABI_MAJOR 1
-#define EE_ABI_MINOR 0
+#define EE_ABI_MINOR 1
 #define EE_ABI_FINGERPRINT 18276775ULL
+/* ABI 1.1: the fingerprint of ee_mind and ee_mind_trace only (ADR-0013). */
+#define EE_MIND_FINGERPRINT 1047490ULL
 
 /* Q16.16 fixed point: all kernel arithmetic is integer (ADR-0006). */
 #define EE_FX_FRACTION_BITS 16
@@ -80,6 +82,9 @@ typedef uint32_t ee_status;
 #define EE_INTENT_FLAG_NEW_TARGET 2u
 #define EE_INTENT_FLAG_UNREACHABLE 4u
 #define EE_INTENT_FLAG_FROM_MEMORY 8u
+#define EE_INTENT_FLAG_STARTLE 16u
+#define EE_INTENT_FLAG_HESITATE 32u
+#define EE_INTENT_FLAG_FIXATE 64u
 
 /* Bits in ee_agent.flags. */
 #define EE_AGENT_FLAG_MEMORY_VALID 1u
@@ -95,6 +100,39 @@ typedef uint32_t ee_status;
 
 /* Ticks a sighting stays actionable before the agent forgets it (Phase 2). */
 #define EE_MEMORY_TTL 36u
+
+/* Bits in ee_contact.flags (ABI 1.1; read only by ee_tick_mind, with EE_CAP_DAMAGE_EVENTS). */
+#define EE_CONTACT_FLAG_DAMAGE_SOURCE 1u
+
+/* Bits in ee_mind_trace.tells: the intent tell bits shifted down by four. */
+#define EE_TELL_STARTLE 1u
+#define EE_TELL_HESITATE 2u
+#define EE_TELL_FIXATE 4u
+
+/* Bits in ee_mind.flags. */
+#define EE_MIND_FLAG_PRIMED 1u
+#define EE_MIND_FLAG_GRUDGE_LEAD 2u
+#define EE_MIND_FLAG_HESITATED 4u
+
+/* Affect tokens, in declaration (and tie-break) order: ee_mind.token, ee_mind_trace.token. */
+#define EE_AFFECT_CALM 0u
+#define EE_AFFECT_WARY 1u
+#define EE_AFFECT_AFRAID 2u
+#define EE_AFFECT_ANGRY 3u
+
+/* Why the affect token changed: ee_mind_trace.cause. NONE exactly when it did not. */
+#define EE_CAUSE_NONE 0u
+#define EE_CAUSE_CLOSE_CONTACT 1u
+#define EE_CAUSE_DAMAGE 2u
+#define EE_CAUSE_CONTRADICTION 3u
+#define EE_CAUSE_LOW_HEALTH 4u
+#define EE_CAUSE_THREATS 5u
+#define EE_CAUSE_NO_AMMO 6u
+#define EE_CAUSE_ATTRIBUTED_DAMAGE 7u
+#define EE_CAUSE_DECAY 8u
+
+/* Full scale of ee_mind_trace.attention, in units of 1/10000 (a mass, not a probability). */
+#define EE_MASS_FULL 10000u
 
 typedef struct {
   uint16_t major;
@@ -285,6 +323,76 @@ typedef struct {
 #define EE_OFFSET_ee_context_ticks_run 56
 #define EE_OFFSET_ee_context_degraded_ticks 64
 
+typedef struct {
+  uint32_t struct_size;
+  uint32_t arousal;
+  uint64_t seen_ids_lo;
+  uint64_t seen_ids_hi;
+  uint32_t fear;
+  uint32_t grievance;
+  ee_fx last_health;
+  ee_fx grudge_x;
+  ee_fx grudge_y;
+  uint32_t grudge_age;
+  uint16_t grudge_id;
+  uint16_t seen_count;
+  uint8_t token;
+  uint8_t hesitate_left;
+  uint8_t flags;
+  uint8_t reserved0;
+} ee_mind;
+
+#define EE_SIZEOF_ee_mind 56
+#define EE_OFFSET_ee_mind_struct_size 0
+#define EE_OFFSET_ee_mind_arousal 4
+#define EE_OFFSET_ee_mind_seen_ids_lo 8
+#define EE_OFFSET_ee_mind_seen_ids_hi 16
+#define EE_OFFSET_ee_mind_fear 24
+#define EE_OFFSET_ee_mind_grievance 28
+#define EE_OFFSET_ee_mind_last_health 32
+#define EE_OFFSET_ee_mind_grudge_x 36
+#define EE_OFFSET_ee_mind_grudge_y 40
+#define EE_OFFSET_ee_mind_grudge_age 44
+#define EE_OFFSET_ee_mind_grudge_id 48
+#define EE_OFFSET_ee_mind_seen_count 50
+#define EE_OFFSET_ee_mind_token 52
+#define EE_OFFSET_ee_mind_hesitate_left 53
+#define EE_OFFSET_ee_mind_flags 54
+#define EE_OFFSET_ee_mind_reserved0 55
+
+typedef struct {
+  uint32_t struct_size;
+  uint32_t target_id;
+  uint64_t tick;
+  uint32_t ranking;
+  uint16_t attention;
+  uint16_t cause_contact;
+  uint8_t ranking_count;
+  uint8_t selected;
+  uint8_t incumbent;
+  uint8_t token;
+  uint8_t token_prev;
+  uint8_t cause;
+  uint8_t tells;
+  uint8_t reserved0;
+} ee_mind_trace;
+
+#define EE_SIZEOF_ee_mind_trace 32
+#define EE_OFFSET_ee_mind_trace_struct_size 0
+#define EE_OFFSET_ee_mind_trace_target_id 4
+#define EE_OFFSET_ee_mind_trace_tick 8
+#define EE_OFFSET_ee_mind_trace_ranking 16
+#define EE_OFFSET_ee_mind_trace_attention 20
+#define EE_OFFSET_ee_mind_trace_cause_contact 22
+#define EE_OFFSET_ee_mind_trace_ranking_count 24
+#define EE_OFFSET_ee_mind_trace_selected 25
+#define EE_OFFSET_ee_mind_trace_incumbent 26
+#define EE_OFFSET_ee_mind_trace_token 27
+#define EE_OFFSET_ee_mind_trace_token_prev 28
+#define EE_OFFSET_ee_mind_trace_cause 29
+#define EE_OFFSET_ee_mind_trace_tells 30
+#define EE_OFFSET_ee_mind_trace_reserved0 31
+
 EE_STATIC_ASSERT(sizeof(ee_version) == EE_SIZEOF_ee_version, "size");
 EE_STATIC_ASSERT(offsetof(ee_version, major) == EE_OFFSET_ee_version_major, "offset");
 EE_STATIC_ASSERT(offsetof(ee_version, minor) == EE_OFFSET_ee_version_minor, "offset");
@@ -369,6 +477,38 @@ EE_STATIC_ASSERT(offsetof(ee_context, tick_rate_num) == EE_OFFSET_ee_context_tic
 EE_STATIC_ASSERT(offsetof(ee_context, tick_rate_den) == EE_OFFSET_ee_context_tick_rate_den, "offset");
 EE_STATIC_ASSERT(offsetof(ee_context, ticks_run) == EE_OFFSET_ee_context_ticks_run, "offset");
 EE_STATIC_ASSERT(offsetof(ee_context, degraded_ticks) == EE_OFFSET_ee_context_degraded_ticks, "offset");
+EE_STATIC_ASSERT(sizeof(ee_mind) == EE_SIZEOF_ee_mind, "size");
+EE_STATIC_ASSERT(offsetof(ee_mind, struct_size) == EE_OFFSET_ee_mind_struct_size, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, arousal) == EE_OFFSET_ee_mind_arousal, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, seen_ids_lo) == EE_OFFSET_ee_mind_seen_ids_lo, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, seen_ids_hi) == EE_OFFSET_ee_mind_seen_ids_hi, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, fear) == EE_OFFSET_ee_mind_fear, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, grievance) == EE_OFFSET_ee_mind_grievance, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, last_health) == EE_OFFSET_ee_mind_last_health, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, grudge_x) == EE_OFFSET_ee_mind_grudge_x, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, grudge_y) == EE_OFFSET_ee_mind_grudge_y, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, grudge_age) == EE_OFFSET_ee_mind_grudge_age, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, grudge_id) == EE_OFFSET_ee_mind_grudge_id, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, seen_count) == EE_OFFSET_ee_mind_seen_count, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, token) == EE_OFFSET_ee_mind_token, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, hesitate_left) == EE_OFFSET_ee_mind_hesitate_left, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, flags) == EE_OFFSET_ee_mind_flags, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind, reserved0) == EE_OFFSET_ee_mind_reserved0, "offset");
+EE_STATIC_ASSERT(sizeof(ee_mind_trace) == EE_SIZEOF_ee_mind_trace, "size");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, struct_size) == EE_OFFSET_ee_mind_trace_struct_size, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, target_id) == EE_OFFSET_ee_mind_trace_target_id, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, tick) == EE_OFFSET_ee_mind_trace_tick, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, ranking) == EE_OFFSET_ee_mind_trace_ranking, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, attention) == EE_OFFSET_ee_mind_trace_attention, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, cause_contact) == EE_OFFSET_ee_mind_trace_cause_contact, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, ranking_count) == EE_OFFSET_ee_mind_trace_ranking_count, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, selected) == EE_OFFSET_ee_mind_trace_selected, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, incumbent) == EE_OFFSET_ee_mind_trace_incumbent, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, token) == EE_OFFSET_ee_mind_trace_token, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, token_prev) == EE_OFFSET_ee_mind_trace_token_prev, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, cause) == EE_OFFSET_ee_mind_trace_cause, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, tells) == EE_OFFSET_ee_mind_trace_tells, "offset");
+EE_STATIC_ASSERT(offsetof(ee_mind_trace, reserved0) == EE_OFFSET_ee_mind_trace_reserved0, "offset");
 
 /*
  * Entry points. The kernel performs NO allocation: `ee_context` and the
@@ -387,6 +527,19 @@ ee_status ee_tick(ee_context *ctx, const ee_snapshot *snap, ee_agent *agent, ee_
 ee_version ee_version_info(void);
 uint64_t ee_abi_fingerprint(void);
 const char *ee_status_name(ee_status status);
+
+/*
+ * ABI 1.1 (ADR-0013): the mind. A host that never calls this gets 1.0 exactly:
+ * `ee_tick` is unchanged and its pinned digests did not move.
+ *
+ * `mind` is caller-owned per-agent state (zeroed, `struct_size` set). `trace` may
+ * be NULL; when it is not, its `struct_size` must be set and one record is written.
+ * The trace publishes a RANKING of modes and the selected mode — never a score —
+ * and an affect TOKEN with an attention mass — never a reservoir value.
+ */
+ee_status ee_tick_mind(ee_context *ctx, const ee_snapshot *snap, ee_agent *agent,
+                       ee_mind *mind, ee_intent *out, ee_mind_trace *trace);
+uint64_t ee_mind_fingerprint(void);
 
 #if defined(__cplusplus)
 }

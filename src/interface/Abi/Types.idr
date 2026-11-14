@@ -122,9 +122,15 @@ record Version where
 
 ||| The ABI version this kernel implements. Bumping `major` is a breaking change
 ||| and requires a new ADR; `minor` is additive (ADR-0005).
+|||
+||| 1.1 (ADR-0013) is additive: two new structs (`ee_mind`, `ee_mind_trace`), one
+||| new entrance (`ee_tick_mind`), and bits the freeze left undefined in
+||| `ee_intent.flags` and `ee_contact.flags`. No existing field changed meaning, size
+||| or offset, `EE_ABI_FINGERPRINT` is still computed over the seven 1.0 structs
+||| only (see `frozenStructs`), and `ee_tick` is the same function it was at 1.0.
 public export
 abiVersion : Version
-abiVersion = MkVersion 1 0 0
+abiVersion = MkVersion 1 1 0
 
 public export
 data Handshake
@@ -377,6 +383,66 @@ contextFields =
   , ("degraded_ticks", U64)
   ]
 
+||| ABI 1.1 (ADR-0013): the per-agent MIND state, caller-owned, one per agent, passed
+||| to `ee_tick_mind` beside the 1.0 `ee_agent`. The host zeroes it and sets
+||| `struct_size`; the kernel never allocates it and keeps nothing between calls
+||| (ADR-0009 decision 6 applies unchanged: no hidden state).
+|||
+||| The three reservoirs are Q16.16 fractions in [0, 65536]. `seen_ids_lo`/`_hi` pack
+||| the ids of the contacts visible on the previous tick (four u16 per word), so a
+||| contact can be recognised as NEW without the kernel keeping a list of its own.
+||| The grudge slot (`grudge_*`) is a second memory, written ONLY by perception of the
+||| contact that harmed the agent — affect decides how long it is attended to, never
+||| what it says (ADR-0013 §2).
+public export
+mindFields : List (String, CType)
+mindFields =
+  [ ("struct_size", U32)
+  , ("arousal", U32)
+  , ("seen_ids_lo", U64)
+  , ("seen_ids_hi", U64)
+  , ("fear", U32)
+  , ("grievance", U32)
+  , ("last_health", Fx)
+  , ("grudge_x", Fx)
+  , ("grudge_y", Fx)
+  , ("grudge_age", U32)
+  , ("grudge_id", U16)
+  , ("seen_count", U16)
+  , ("token", U8)
+  , ("hesitate_left", U8)
+  , ("flags", U8)
+  , ("reserved0", U8)
+  ]
+
+||| ABI 1.1 (ADR-0013): one record per agent per tick, written by `ee_tick_mind` when
+||| the host passes one. It is the kernel's half of `enaction-mind-trace/1`: the
+||| affect TOKEN and an attention MASS (never a reservoir value), the RANKING of the
+||| mode candidates (an order, never a score), the incumbent and selected modes, the
+||| cause of a token change, and the tells. Commitment override is deliberately NOT a
+||| field: a reader derives it from `ranking`, `incumbent` and `selected`.
+|||
+||| `ranking` packs mode codes four bits each, rank 0 in the low nibble;
+||| `ranking_count` says how many nibbles are meaningful.
+public export
+mindTraceFields : List (String, CType)
+mindTraceFields =
+  [ ("struct_size", U32)
+  , ("target_id", U32)
+  , ("tick", U64)
+  , ("ranking", U32)
+  , ("attention", U16)
+  , ("cause_contact", U16)
+  , ("ranking_count", U8)
+  , ("selected", U8)
+  , ("incumbent", U8)
+  , ("token", U8)
+  , ("token_prev", U8)
+  , ("cause", U8)
+  , ("tells", U8)
+  , ("reserved0", U8)
+  ]
+
 --------------------------------------------------------------------------------
 -- The proven literal size lists
 --------------------------------------------------------------------------------
@@ -502,6 +568,134 @@ memoryTtl : Nat
 memoryTtl = 36
 
 --------------------------------------------------------------------------------
+-- ABI 1.1: the mind (ADR-0013) — wire constants only
+--------------------------------------------------------------------------------
+-- The NAMES a host needs: bits it reads, codes it decodes. The constants that make
+-- the mind behave (leak shifts, thresholds, gains) are policy, not ABI, and live in
+-- `Abi.Affect` and the kernel only — the same split ADR-0010 §3 made for the weights.
+
+||| `ee_contact.flags` bit 0: the host attributes this tick's damage to this contact.
+||| The freeze left every bit of `ee_contact.flags` undefined; defining one is
+||| additive (ADR-0009 precedent). Read ONLY by `ee_tick_mind`, and only when the host
+||| declared `EE_CAP_DAMAGE_EVENTS`; `ee_tick` never reads it.
+public export
+contactFlagDamageSource : Nat
+contactFlagDamageSource = 1
+
+||| The bodily tells, as `ee_intent.flags` bits 4..6 (bits 0..3 are 1.0's). Set only
+||| by `ee_tick_mind`; `ee_tick` never sets them, so a 1.0 host never sees them.
+public export
+intentFlagStartle : Nat
+intentFlagStartle = 16
+
+public export
+intentFlagHesitate : Nat
+intentFlagHesitate = 32
+
+public export
+intentFlagFixate : Nat
+intentFlagFixate = 64
+
+||| The same tells as `ee_mind_trace.tells` bits: the intent bit shifted down by four.
+public export
+tellStartle : Nat
+tellStartle = 1
+
+public export
+tellHesitate : Nat
+tellHesitate = 2
+
+public export
+tellFixate : Nat
+tellFixate = 4
+
+||| `ee_mind.flags` bits.
+public export
+mindFlagPrimed : Nat
+mindFlagPrimed = 1
+
+public export
+mindFlagGrudgeLead : Nat
+mindFlagGrudgeLead = 2
+
+public export
+mindFlagHesitated : Nat
+mindFlagHesitated = 4
+
+||| The affect-token vocabulary, in declaration order — which is also the tie-break
+||| order (`enaction-mind-trace/1` "affect_tokens": calm, wary, afraid, angry).
+public export
+affectCalm : Nat
+affectCalm = 0
+
+public export
+affectWary : Nat
+affectWary = 1
+
+public export
+affectAfraid : Nat
+affectAfraid = 2
+
+public export
+affectAngry : Nat
+affectAngry = 3
+
+||| Why a token changed: which INPUT caused it. `NONE` appears exactly when the token
+||| did not change (`Abi.Affect.tokenChangeHasCause`).
+public export
+causeNone : Nat
+causeNone = 0
+
+public export
+causeCloseContact : Nat
+causeCloseContact = 1
+
+public export
+causeDamage : Nat
+causeDamage = 2
+
+public export
+causeContradiction : Nat
+causeContradiction = 3
+
+public export
+causeLowHealth : Nat
+causeLowHealth = 4
+
+public export
+causeThreats : Nat
+causeThreats = 5
+
+public export
+causeNoAmmo : Nat
+causeNoAmmo = 6
+
+public export
+causeAttributedDamage : Nat
+causeAttributedDamage = 7
+
+public export
+causeDecay : Nat
+causeDecay = 8
+
+||| Full scale of an attention mass (`enaction` ADR-0016: units of 1/10 000).
+public export
+massFull : Nat
+massFull = 10000
+
+||| The tells sit above every 1.0 intent bit: the lowest tell (16) is above the
+||| highest 1.0 bit (8), so no tell can be mistaken for a 1.0 flag.
+export
+tellsAboveTheFrozenBits : So (8 < 16)
+tellsAboveTheFrozenBits = Oh
+
+export
+intentTellsAreTheTraceTellsShifted :
+  ( Abi.Types.intentFlagStartle, Abi.Types.intentFlagHesitate, Abi.Types.intentFlagFixate )
+  = ( Abi.Types.tellStartle * 16, Abi.Types.tellHesitate * 16, Abi.Types.tellFixate * 16 )
+intentTellsAreTheTraceTellsShifted = Refl
+
+--------------------------------------------------------------------------------
 -- Total name maps and enumerations
 --------------------------------------------------------------------------------
 -- Each of these PATTERN MATCHES ON EVERY CONSTRUCTOR of its type. That is the
@@ -575,9 +769,13 @@ record Struct where
   sTag : String
   sFields : List (String, CType)
 
+||| The seven structs frozen at ABI 1.0. `EE_ABI_FINGERPRINT` is computed over THESE
+||| and nothing else, because a 1.0 host compiled `EE_ABI_FINGERPRINT` into its
+||| binary and `ee_init` compares against it: a fingerprint that grew to cover the
+||| 1.1 structs would refuse every 1.0 host, which is the opposite of additive.
 public export
-allStructs : List Struct
-allStructs =
+frozenStructs : List Struct
+frozenStructs =
   [ MkStruct "ee_version" versionFields
   , MkStruct "ee_init_desc" initDescFields
   , MkStruct "ee_contact" contactFields
@@ -586,6 +784,21 @@ allStructs =
   , MkStruct "ee_intent" intentFields
   , MkStruct "ee_context" contextFields
   ]
+
+||| The structs ABI 1.1 adds (ADR-0013). They carry their own fingerprint,
+||| `EE_MIND_FINGERPRINT`, and each carries `struct_size`, which `ee_tick_mind` checks
+||| on every call.
+public export
+mindStructs : List Struct
+mindStructs =
+  [ MkStruct "ee_mind" mindFields
+  , MkStruct "ee_mind_trace" mindTraceFields
+  ]
+
+||| Every struct the header emits, frozen first, in emission order.
+public export
+allStructs : List Struct
+allStructs = frozenStructs ++ mindStructs
 
 ||| The literal size list that `Abi.Layout` proves theorems about, paired with
 ||| the same struct, so `Abi.Gen` can cross-check named fields against proven
@@ -600,4 +813,6 @@ provenSizeLists =
   , [8, 8, 4, 4, 4, 4, 4, 4, 4, 4]
   , [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
   , [4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8, 8]
+  , [4, 4, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 1, 1, 1, 1]
+  , [4, 4, 8, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]
   ]

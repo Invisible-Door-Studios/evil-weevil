@@ -325,6 +325,57 @@ contextU64Aligned : ( (24 `mod` 8) = 0, (64 `mod` 8) = 0 )
 contextU64Aligned = (Refl, Refl)
 
 --------------------------------------------------------------------------------
+-- ee_mind — 56 bytes, caller-owned, ABI 1.1 (ADR-0013)
+--------------------------------------------------------------------------------
+
+export
+mindOffsets : offsetsOf [4, 4, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 1, 1, 1, 1] =
+  [0, 4, 8, 16, 24, 28, 32, 36, 40, 44, 48, 50, 52, 53, 54, 55]
+mindOffsets = Refl
+
+export
+mindSize : totalOf [4, 4, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 1, 1, 1, 1] = 56
+mindSize = Refl
+
+export
+mindSizeAligned : (56 `mod` 8) = 0
+mindSizeAligned = Refl
+
+||| `struct_size` is at offset 0, as in `ee_init_desc`, so a host can be told it
+||| passed the wrong struct before a single other field is trusted.
+export
+mindStructSizeFirst : offsetAt 0 [4, 4, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 1, 1, 1, 1] = 0
+mindStructSizeFirst = Refl
+
+||| The two u64 words (the previous tick's contact ids) at 8 and 16, the two u16s at
+||| 48 and 50: every field sits on its own alignment, so no compiler pads.
+export
+mindFieldsAligned : ( (8 `mod` 8) = 0, (16 `mod` 8) = 0, (48 `mod` 2) = 0, (50 `mod` 2) = 0 )
+mindFieldsAligned = (Refl, Refl, Refl, Refl)
+
+--------------------------------------------------------------------------------
+-- ee_mind_trace — 32 bytes, written by the kernel, ABI 1.1 (ADR-0013)
+--------------------------------------------------------------------------------
+
+export
+mindTraceOffsets : offsetsOf [4, 4, 8, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1] =
+  [0, 4, 8, 16, 20, 22, 24, 25, 26, 27, 28, 29, 30, 31]
+mindTraceOffsets = Refl
+
+export
+mindTraceSize : totalOf [4, 4, 8, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1] = 32
+mindTraceSize = Refl
+
+export
+mindTraceSizeAligned : (32 `mod` 8) = 0
+mindTraceSizeAligned = Refl
+
+||| `tick` (u64) at 8, `attention` and `cause_contact` (u16) at 20 and 22.
+export
+mindTraceFieldsAligned : ( (8 `mod` 8) = 0, (20 `mod` 2) = 0, (22 `mod` 2) = 0 )
+mindTraceFieldsAligned = (Refl, Refl, Refl)
+
+--------------------------------------------------------------------------------
 -- Cross-struct facts
 --------------------------------------------------------------------------------
 
@@ -338,5 +389,7 @@ allStructSizesAligned : ( (8 `mod` 8) = 0
                         , (184 `mod` 8) = 0
                         , (48 `mod` 8) = 0
                         , (48 `mod` 8) = 0
-                        , (72 `mod` 8) = 0 )
-allStructSizesAligned = (Refl, Refl, Refl, Refl, Refl, Refl, Refl)
+                        , (72 `mod` 8) = 0
+                        , (56 `mod` 8) = 0
+                        , (32 `mod` 8) = 0 )
+allStructSizesAligned = (Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl)

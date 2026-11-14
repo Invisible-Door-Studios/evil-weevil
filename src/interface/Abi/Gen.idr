@@ -94,6 +94,9 @@ allIntentFlags =
   , ("NEW_TARGET", intentFlagNewTarget)
   , ("UNREACHABLE", intentFlagUnreachable)
   , ("FROM_MEMORY", intentFlagFromMemory)
+  , ("STARTLE", intentFlagStartle)
+  , ("HESITATE", intentFlagHesitate)
+  , ("FIXATE", intentFlagFixate)
   ]
 
 ||| Bits in `ee_agent.flags` — the agent's own state, as opposed to the intent it
@@ -131,6 +134,49 @@ allAgentModes =
   , ("INVESTIGATE", agentModeInvestigate)
   ]
 
+||| ABI 1.1 (ADR-0013): the names of the mind. Every list below is (NAME, value) and
+||| becomes `#define EE_<PREFIX>_<NAME> <value>u` in C and `pub const <PREFIX>_<NAME>`
+||| in Zig, so the two languages cannot disagree about a bit or a code. The constants
+||| that make the mind BEHAVE (shifts, thresholds, gains) are not here: like the
+||| utility weights and the mode margin, they are policy, and stay out of the header.
+public export
+mindConstGroups : List (String, String, List (String, Nat))
+mindConstGroups =
+  [ ( "CONTACT_FLAG"
+    , "Bits in ee_contact.flags (ABI 1.1; read only by ee_tick_mind, with EE_CAP_DAMAGE_EVENTS)."
+    , [ ("DAMAGE_SOURCE", contactFlagDamageSource) ] )
+  , ( "TELL"
+    , "Bits in ee_mind_trace.tells: the intent tell bits shifted down by four."
+    , [ ("STARTLE", tellStartle), ("HESITATE", tellHesitate), ("FIXATE", tellFixate) ] )
+  , ( "MIND_FLAG"
+    , "Bits in ee_mind.flags."
+    , [ ("PRIMED", mindFlagPrimed), ("GRUDGE_LEAD", mindFlagGrudgeLead)
+      , ("HESITATED", mindFlagHesitated) ] )
+  , ( "AFFECT"
+    , "Affect tokens, in declaration (and tie-break) order: ee_mind.token, ee_mind_trace.token."
+    , [ ("CALM", affectCalm), ("WARY", affectWary), ("AFRAID", affectAfraid)
+      , ("ANGRY", affectAngry) ] )
+  , ( "CAUSE"
+    , "Why the affect token changed: ee_mind_trace.cause. NONE exactly when it did not."
+    , [ ("NONE", causeNone), ("CLOSE_CONTACT", causeCloseContact), ("DAMAGE", causeDamage)
+      , ("CONTRADICTION", causeContradiction), ("LOW_HEALTH", causeLowHealth)
+      , ("THREATS", causeThreats), ("NO_AMMO", causeNoAmmo)
+      , ("ATTRIBUTED_DAMAGE", causeAttributedDamage), ("DECAY", causeDecay) ] )
+  , ( "MASS"
+    , "Full scale of ee_mind_trace.attention, in units of 1/10000 (a mass, not a probability)."
+    , [ ("FULL", massFull) ] )
+  ]
+
+mindGroupC : (String, String, List (String, Nat)) -> String
+mindGroupC (pfx, comment, entries) =
+  "/* " ++ comment ++ " */\n"
+  ++ unlines (map (\(n, v) => "#define EE_" ++ pfx ++ "_" ++ n ++ " " ++ show v ++ "u") entries)
+  ++ "\n"
+
+mindGroupZig : (String, String, List (String, Nat)) -> List String
+mindGroupZig (pfx, _, entries) =
+  map (\(n, v) => "pub const " ++ pfx ++ "_" ++ n ++ ": u32 = " ++ show v ++ ";") entries
+
 --------------------------------------------------------------------------------
 -- Checksumming the layout
 --------------------------------------------------------------------------------
@@ -146,9 +192,16 @@ flat : List (List Nat) -> List Nat
 flat [] = []
 flat (x :: xs) = x ++ flat xs
 
-||| Every field size in the ABI, in struct and field order.
-allSizes : List Nat
-allSizes = flat (map (sizesOf . sFields) allStructs)
+||| Every field size in a set of structs, in struct and field order.
+sizesIn : List Struct -> List Nat
+sizesIn sts = flat (map (sizesOf . sFields) sts)
+
+||| The checksum formula, over any set of structs.
+checksumOf : List Struct -> Nat
+checksumOf sts =
+  weighted 0 (sizesIn sts) * 1024
+  + length (sizesIn sts) * 32
+  + length sts
 
 ||| The ABI checksum: position-weighted sum of every field size, mixed with the
 ||| field count and the struct count.
@@ -166,11 +219,18 @@ allSizes = flat (map (sizesOf . sFields) allStructs)
 |||     is O(value / modulus) and hangs for an hour on a 2^64 modulus (measured).
 |||     Field names are deliberately NOT included: renaming a field does not change
 |||     the wire format, so it must not change the checksum.
+|||
+||| ABI 1.1 (ADR-0013): computed over `frozenStructs` — the seven 1.0 structs — and
+||| NOT over `allStructs`. A 1.0 host compiled this number into its binary and
+||| `ee_init` refuses a mismatch, so covering the 1.1 structs here would refuse every
+||| 1.0 host: the opposite of additive. The value is still 18276775.
 layoutChecksum : Nat
-layoutChecksum =
-  weighted 0 allSizes * 1024
-  + length allSizes * 32
-  + length allStructs
+layoutChecksum = checksumOf frozenStructs
+
+||| The same drift detector over the structs 1.1 added. A host that uses
+||| `ee_tick_mind` can compare `ee_mind_fingerprint()` against `EE_MIND_FINGERPRINT`.
+mindChecksum : Nat
+mindChecksum = checksumOf mindStructs
 
 --------------------------------------------------------------------------------
 -- Cross-checks — nothing is emitted until these pass
@@ -280,6 +340,8 @@ headerPreamble =
     , "#define EE_ABI_MAJOR " ++ cVersionNum abiVersion
     , "#define EE_ABI_MINOR " ++ cVersionMinor abiVersion
     , "#define EE_ABI_FINGERPRINT " ++ show layoutChecksum ++ "ULL"
+    , "/* ABI 1.1: the fingerprint of ee_mind and ee_mind_trace only (ADR-0013). */"
+    , "#define EE_MIND_FINGERPRINT " ++ show mindChecksum ++ "ULL"
     , ""
     , "/* Q16.16 fixed point: all kernel arithmetic is integer (ADR-0006). */"
     , "#define EE_FX_FRACTION_BITS " ++ show fxFractionBits
@@ -308,6 +370,19 @@ entryPoints =
     , "ee_version ee_version_info(void);"
     , "uint64_t ee_abi_fingerprint(void);"
     , "const char *ee_status_name(ee_status status);"
+    , ""
+    , "/*"
+    , " * ABI 1.1 (ADR-0013): the mind. A host that never calls this gets 1.0 exactly:"
+    , " * `ee_tick` is unchanged and its pinned digests did not move."
+    , " *"
+    , " * `mind` is caller-owned per-agent state (zeroed, `struct_size` set). `trace` may"
+    , " * be NULL; when it is not, its `struct_size` must be set and one record is written."
+    , " * The trace publishes a RANKING of modes and the selected mode — never a score —"
+    , " * and an affect TOKEN with an attention mass — never a reservoir value."
+    , " */"
+    , "ee_status ee_tick_mind(ee_context *ctx, const ee_snapshot *snap, ee_agent *agent,"
+    , "                       ee_mind *mind, ee_intent *out, ee_mind_trace *trace);"
+    , "uint64_t ee_mind_fingerprint(void);"
     , ""
     , "#if defined(__cplusplus)"
     , "}"
@@ -339,6 +414,7 @@ renderHeader =
              ++ "\n"
              ++ "/* Ticks a sighting stays actionable before the agent forgets it (Phase 2). */\n"
              ++ "#define EE_MEMORY_TTL " ++ show memoryTtl ++ "u\n\n"
+             ++ concatMap mindGroupC mindConstGroups
              ++ unlines (map structBlock sts)
              ++ unlines (concatMap staticAsserts sts)
              ++ "\n"
@@ -364,6 +440,7 @@ zigPreamble =
       , "pub const abi_major: u32 = " ++ cVersionNum abiVersion ++ ";"
       , "pub const abi_minor: u32 = " ++ cVersionMinor abiVersion ++ ";"
       , "pub const abi_fingerprint: u64 = " ++ show layoutChecksum ++ ";"
+      , "pub const mind_fingerprint: u64 = " ++ show mindChecksum ++ ";"
       , "pub const fx_fraction_bits: u32 = " ++ show fxFractionBits ++ ";"
       , "pub const fx_one: i32 = " ++ show fxOne ++ ";"
       , ""
@@ -381,6 +458,7 @@ zigPreamble =
       ++ map agentFlagZigConst allAgentFlags
       ++ map agentModeZigConst allAgentModes
       ++ [ "pub const memory_ttl: u32 = " ++ show memoryTtl ++ ";" ]
+      ++ concatMap mindGroupZig mindConstGroups
       ++ [ "" ] )
 
 zigStruct : (Struct, List Nat) -> List String
@@ -445,6 +523,7 @@ main = do
   putStrLn "ee abi-gen — generating the seam from Abi.Types"
   putStrLn ("  abi version:   " ++ cVersionNum abiVersion ++ "." ++ cVersionMinor abiVersion)
   putStrLn ("  fingerprint:   " ++ show layoutChecksum)
+  putStrLn ("  mind (1.1):    " ++ show mindChecksum)
   case (renderHeader, renderZig) of
     (Left m, _) => reportMismatch m
     (_, Left m) => reportMismatch m
