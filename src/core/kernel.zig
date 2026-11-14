@@ -615,6 +615,12 @@ const FIXATE_GRIEVANCE: u32 = 32768; // 0.5 — gaze locks onto the grudge targe
 // Effects on attention and commitment.
 const AROUSAL_TTL_SHIFT: u5 = 11; // memory lifetime + arousal / 2048: at most +32 ticks
 const FEAR_EVADE_SHIFT: u5 = 4; // evade score + fear / 16: at most +4096, below reload
+// Fear also widens the wound threshold: wounded below 0.25 + fear / 4 (at most 0.5).
+// Without this the evade bonus alone RE-CREATED the flapping ADR-0012 removed: on the
+// wounded duel a frightened agent fled on every wounded tick and re-engaged on every
+// healed one — 75 switches in 100 ticks, measured. Health is read, never rewritten:
+// this is how much the agent weighs its health (attention), not what it believes it is.
+const FEAR_WOUND_SHIFT: u5 = 2;
 const GRIEVANCE_MARGIN_SHIFT: u5 = 2; // pursuit margin + grievance / 4: at most +16384
 
 /// Ceil(x / 2^k) for x > 0, and 0 for 0 — the leak. Rounding UP is what makes a
@@ -765,7 +771,7 @@ fn mindUtility(action: u32, snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?
     return switch (action) {
         abi.ACTION_RELOAD => if (snap.ammo == 0) UTILITY_RELOAD else 0,
         abi.ACTION_FLEE => if (near) |n|
-            (if (snap.health < WOUNDED_BELOW and n.distance < FLEE_RANGE)
+            (if (snap.health < woundedBelow(fear) and n.distance < FLEE_RANGE)
                 UTILITY_FLEE + (@min(fear, FULL) >> FEAR_EVADE_SHIFT)
             else
                 0)
@@ -784,6 +790,11 @@ fn mindUtility(action: u32, snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?
             UTILITY_ADVANCE,
         else => 0,
     };
+}
+
+/// The wound threshold under fear: 1.0's 0.25 at rest (`Abi.Affect.calmWoundIsTheFrozenWound`).
+pub fn woundedBelow(fear: u32) i32 {
+    return WOUNDED_BELOW + @as(i32, @intCast(@min(fear, FULL) >> FEAR_WOUND_SHIFT));
 }
 
 fn mindCandidates(near: ?Nearest, lead: ?Lead) []const u32 {

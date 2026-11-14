@@ -89,6 +89,12 @@ public export
 fearEvadeDiv : Nat
 fearEvadeDiv = 16
 
+||| The wound threshold gains fear / 4: at most 16384, so a terrified agent counts itself
+||| wounded below 0.5 instead of 0.25.
+public export
+fearWoundDiv : Nat
+fearWoundDiv = 4
+
 ||| A pursuit's margin gains grievance / 4: at most 16384.
 public export
 grievanceMarginDiv : Nat
@@ -528,6 +534,28 @@ record MindSituation where
   msLead      : Bool
   msFear      : Nat
 
+||| Is the agent wounded, as far as fleeing is concerned? Health is READ here, never
+||| written: fear changes how much the agent weighs its health, not what it believes its
+||| health to be. Without this the evade bonus alone re-created the S2 flapping on the
+||| wounded duel (75 switches in 100 ticks, measured); with it, zero.
+public export
+woundedFor : (health, fear : Nat) -> Bool
+woundedFor h f = h < 16384 + idiv (clampTo Abi.Affect.full f) Abi.Affect.fearWoundDiv
+
+||| AT REST THE WOUND IS 1.0's: for every health, fear zero gives the frozen threshold.
+export
+calmWoundIsTheFrozenWound : (h : Nat) -> woundedFor h 0 = (h < 16384)
+calmWoundIsTheFrozenWound h = Refl
+
+||| The wounded duel's two healths: at rest only 16383 is wounded — the boundary the
+||| fixture flips across every tick. A little fear (2048, one tick of low health) puts
+||| both on the same side, so the precondition stops flipping.
+export
+fearSteadiesTheWound :
+  ( woundedFor 16383 0, woundedFor 16384 0, woundedFor 16383 2048, woundedFor 16384 2048 )
+  = (True, False, True, True)
+fearSteadiesTheWound = Refl
+
 ||| The mind's score for each mode. Equal to `Abi.Utility.scoreOf` when fear is zero and
 ||| the lead is 1.0's (see `calmMindAgreesWithTheGraph`).
 public export
@@ -652,6 +680,18 @@ fearBreaksTheWoundedDuel :
   , mindChoose ModeEngage Abi.Modes.stickiness (MkMind True 40000 True False False 65536) )
   = (ModeEngage, ModeEvade)
 fearBreaksTheWoundedDuel = Refl
+
+||| And having broken off, it does not flap: at the fixture's steady fear (32708) an
+||| evading agent stays evading on BOTH of the duel's healths, because both are wounded
+||| under fear. (At fear zero the healed tick would release it — `healedAgentReengages`.)
+export
+theFrightenedDuelDoesNotFlap :
+  ( mindChoose ModeEvade Abi.Modes.stickiness
+      (MkMind True 40000 (woundedFor 16383 32708) False False 32708)
+  , mindChoose ModeEvade Abi.Modes.stickiness
+      (MkMind True 40000 (woundedFor 16384 32708) False False 32708) )
+  = (ModeEvade, ModeEvade)
+theFrightenedDuelDoesNotFlap = Refl
 
 ||| A CALM MIND IS THE 1.0 GRAPH: with fear zero, grievance zero and the lead exactly
 ||| 1.0's (nothing visible and the memory fresh), the mind chooses `Abi.Modes.nextMode`'s

@@ -444,6 +444,68 @@ static void print_mind(const char *name, const struct mind_run *r)
            r->fixates, r->investigate, (unsigned)r->max_grievance);
 }
 
+/* "The frightened duel": the 1.0 wounded duel (pinned under ee_tick at
+ * 5191914376283395890) through ee_tick_mind. Low health fills fear; fear raises evade
+ * AND widens the wound threshold, so the agent flees and keeps fleeing. MEASURED with
+ * the bonus alone: 75 switches in 100 ticks. With the widening: zero. */
+struct duel_run { uint64_t digest; unsigned flee, switches, unexplained, uncaused; };
+
+static struct duel_run run_frightened_duel(void)
+{
+    struct duel_run r;
+    memset(&r, 0, sizeof r);
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_DAMAGE_EVENTS;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+    uint32_t prev = 0;
+    for (uint64_t t = 0; t < 100u; ++t) {
+        ee_snapshot snap = make_flap_snapshot(t);
+        ee_intent i;
+        ee_mind_trace tr;
+        memset(&tr, 0, sizeof tr);
+        tr.struct_size = (uint32_t)sizeof tr;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &tr) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        if (i.action == EE_ACTION_FLEE) r.flee++;
+        if (t > 0 && prev != i.action) r.switches++;
+        prev = i.action;
+        const uint32_t first = tr.ranking & 0xFu;
+        if (tr.selected != first && tr.selected != tr.incumbent) r.unexplained++;
+        if ((tr.token != tr.token_prev) != (tr.cause != EE_CAUSE_NONE)) r.uncaused++;
+        r.digest = r.digest * 1099511628211ULL + i.action;
+        r.digest = r.digest * 1099511628211ULL + i.target_id;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        r.digest = r.digest * 1099511628211ULL + i.flags;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking;
+        r.digest = r.digest * 1099511628211ULL + tr.selected;
+        r.digest = r.digest * 1099511628211ULL + tr.incumbent;
+        r.digest = r.digest * 1099511628211ULL + tr.token;
+        r.digest = r.digest * 1099511628211ULL + tr.cause;
+        r.digest = r.digest * 1099511628211ULL + tr.attention;
+    }
+    return r;
+}
+
 int main(void)
 {
     /* Layout, as this compiler produced it. The header already asserted these at
@@ -650,6 +712,15 @@ int main(void)
               "every token change has a cause, and no unchanged token has one");
         check(g.over_mass + gc.over_mass + f.over_mass + fc.over_mass == 0u,
               "attention never exceeds full mass");
+    }
+
+    {
+        const struct duel_run d = run_frightened_duel();
+        printf("  mind %-15s digest %llu (flee=%u switches=%u)\n", "frightened-duel",
+               (unsigned long long)d.digest, d.flee, d.switches);
+        check(d.digest == 11063771574841757445ULL, "the frightened-duel digest matches the pinned value");
+        check(d.switches == 0u && d.flee == 100u, "a frightened agent flees and does not flap");
+        check(d.unexplained == 0u && d.uncaused == 0u, "the frightened duel's trace is explained and caused");
     }
 
     if (failures) {

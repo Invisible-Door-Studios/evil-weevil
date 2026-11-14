@@ -777,3 +777,60 @@ test "MIND: reservoirs stay in [0, FULL] and drain to zero, even from garbage" {
     try std.testing.expectEqual(@as(u16, 10000), kernel.massOf(65536));
     try std.testing.expectEqual(@as(u16, 10000), kernel.massOf(0xFFFF_FFFF));
 }
+
+fn runFrightenedDuel(ticks: u64) struct { digest: u64, attack: u32, flee: u32, switches: u32, first_flee: ?u64, max_fear: u32, overrides: u32, uncaused: u32, unexplained: u32 } {
+    var ctx = context(0xEE_0000_0000_0001, MIND_CAPS, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var r: @TypeOf(runFrightenedDuel(0)) = .{ .digest = 0, .attack = 0, .flee = 0, .switches = 0, .first_flee = null, .max_fear = 0, .overrides = 0, .uncaused = 0, .unexplained = 0 };
+    var prev: ?u32 = null;
+    var t: u64 = 0;
+    while (t < ticks) : (t += 1) {
+        const snap = flapSnapshot(t);
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        const i = res.intent;
+        const tr = res.trace;
+        if (i.action == abi.ACTION_ATTACK) r.attack += 1;
+        if (i.action == abi.ACTION_FLEE) {
+            r.flee += 1;
+            if (r.first_flee == null) r.first_flee = t;
+        }
+        if (prev) |p| if (p != i.action) {
+            r.switches += 1;
+        };
+        prev = i.action;
+        r.max_fear = @max(r.max_fear, mind.fear);
+        const first: u32 = tr.ranking & 0xF;
+        if (tr.selected == tr.incumbent and tr.selected != first) r.overrides += 1;
+        if (tr.selected != first and tr.selected != tr.incumbent) r.unexplained += 1;
+        if ((tr.token != tr.token_prev) != (tr.cause != abi.CAUSE_NONE)) r.uncaused += 1;
+        r.digest = r.digest *% 1099511628211 +% i.action;
+        r.digest = r.digest *% 1099511628211 +% i.target_id;
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        r.digest = r.digest *% 1099511628211 +% i.flags;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking;
+        r.digest = r.digest *% 1099511628211 +% tr.selected;
+        r.digest = r.digest *% 1099511628211 +% tr.incumbent;
+        r.digest = r.digest *% 1099511628211 +% tr.token;
+        r.digest = r.digest *% 1099511628211 +% tr.cause;
+        r.digest = r.digest *% 1099511628211 +% tr.attention;
+    }
+    return r;
+}
+
+test "MIND: the frightened duel — fear breaks the engagement and the agent does not flap" {
+    // The 1.0 wounded duel (health 16383/16384, contact at 40000) through ee_tick_mind.
+    // Under ee_tick it is pinned at 5191914376283395890: attack on all 100 ticks, zero
+    // switches. Under the mind, low health fills fear, and fear both raises evade and
+    // widens the wound threshold — so the agent flees, and keeps fleeing. MEASURED with
+    // the score bonus alone (no threshold widening): 75 switches in 100 ticks, the
+    // flapping ADR-0012 removed. With the widening: zero.
+    const r = runFrightenedDuel(100);
+    std.debug.print("MIND frightened-duel: {any}\n", .{r});
+    try std.testing.expectEqual(@as(u32, 0), r.switches);
+    try std.testing.expectEqual(@as(u32, 100), r.flee);
+    try std.testing.expectEqual(@as(u32, 0), r.unexplained);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u64, 11063771574841757445), r.digest);
+}
