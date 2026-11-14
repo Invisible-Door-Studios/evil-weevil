@@ -498,3 +498,282 @@ test "the RNG advances and is reproducible" {
     }
     try std.testing.expect(a != b or true); // both advanced identically, by design
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// ABI 1.1 — the mind (ADR-0013). Duplicated in tests/host/null_host.c on purpose:
+// two hosts, two languages, one trace per fixture, checked by digest.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The capabilities both hosts declare for the mind fixtures. DAMAGE_EVENTS is the one
+/// that matters: without it the grievance reservoir must stay at zero.
+const MIND_CAPS: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT | abi.CAP_DAMAGE_EVENTS;
+const MIND_CAPS_NO_DAMAGE: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT;
+
+fn freshMind() abi.EeMind {
+    var m = std.mem.zeroes(abi.EeMind);
+    m.struct_size = @sizeOf(abi.EeMind);
+    return m;
+}
+
+fn setContact(s: *abi.EeSnapshot, slot: usize, c: abi.EeContact) void {
+    switch (slot) {
+        0 => s.contact0 = c,
+        1 => s.contact1 = c,
+        else => unreachable,
+    }
+}
+
+/// "The grudge". Contact A (id 21) stands at 100000 — beyond attack range, beyond
+/// close range — and hits the agent on ticks 10, 11 and 12 (health 1.0 → 0.625),
+/// flagged as the damage source. A leaves sight at tick 13. At tick 20 contact B
+/// (id 22) appears at 40000: nearer, inside attack range, a lower threat. A calm
+/// agent attacks B. A grudging agent keeps hunting A.
+fn grudgeSnapshot(t: u64) abi.EeSnapshot {
+    const health: i32 = if (t < 10) FX else if (t == 10) 57344 else if (t == 11) 49152 else 40960;
+    var s = snapshot(t, 7, health, FX * 3, 0);
+    var n: u16 = 0;
+    if (t < 13) {
+        setContact(&s, n, .{
+            .id = 21,
+            .flags = if (t >= 10 and t <= 12) @intCast(abi.CONTACT_FLAG_DAMAGE_SOURCE) else 0,
+            .bearing_cos = 16384,
+            .bearing_sin = 8192,
+            .distance = 100000,
+            .threat = FX / 2,
+        });
+        n += 1;
+    }
+    if (t >= 20) {
+        setContact(&s, n, .{
+            .id = 22,
+            .flags = 0,
+            .bearing_cos = 8192,
+            .bearing_sin = 16384,
+            .distance = 40000,
+            .threat = FX / 8,
+        });
+        n += 1;
+    }
+    s.contact_count = n;
+    return s;
+}
+
+/// "The flinch". Contact C (id 31) appears at tick 10 and is visible for ten ticks,
+/// then gone. At 40000 it is a surprise at close range; the CONTROL places it at
+/// 98304 (1.5, beyond close range) and changes nothing else.
+fn flinchSnapshot(t: u64, distance: i32) abi.EeSnapshot {
+    var s = snapshot(t, 7, FX, FX * 3, 0);
+    if (t >= 10 and t < 20) {
+        setContact(&s, 0, .{
+            .id = 31,
+            .flags = 0,
+            .bearing_cos = 16384,
+            .bearing_sin = 8192,
+            .distance = distance,
+            .threat = FX / 2,
+        });
+        s.contact_count = 1;
+    }
+    return s;
+}
+
+const MindFixture = enum { grudge, flinch, flinch_control };
+
+const MindRun = struct {
+    digest: u64 = 0,
+    actions: [9]u32 = [_]u32{0} ** 9,
+    overrides: u32 = 0, // selected == incumbent and not first in the ranking (derived here)
+    unexplained: u32 = 0, // selected neither first nor incumbent — must be 0
+    uncaused: u32 = 0, // token changed with CAUSE_NONE, or kept with a cause — must be 0
+    token_changes: u32 = 0,
+    startles: u32 = 0,
+    hesitates: u32 = 0,
+    fixates: u32 = 0,
+    over_mass: u32 = 0, // attention above full mass — must be 0
+    first_override: ?u64 = null,
+    last_override: ?u64 = null,
+    first_startle: ?u64 = null,
+    max_grievance: u32 = 0,
+    arousal_at: [4]u32 = [_]u32{0} ** 4, // arousal after ticks 10, 20, 60, 299
+};
+
+fn runMind(fixture: MindFixture, caps: u32, ticks: u64) MindRun {
+    var ctx = context(0xEE_0000_0000_0001, caps, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var r = MindRun{};
+    var t: u64 = 0;
+    while (t < ticks) : (t += 1) {
+        const snap = switch (fixture) {
+            .grudge => grudgeSnapshot(t),
+            .flinch => flinchSnapshot(t, 40000),
+            .flinch_control => flinchSnapshot(t, 98304),
+        };
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        const i = res.intent;
+        const tr = res.trace;
+
+        if (i.action < 9) r.actions[i.action] += 1;
+        const first: u32 = tr.ranking & 0xF;
+        if (tr.selected == tr.incumbent and tr.selected != first) {
+            r.overrides += 1;
+            if (r.first_override == null) r.first_override = t;
+            r.last_override = t;
+        }
+        if (tr.selected != first and tr.selected != tr.incumbent) r.unexplained += 1;
+        if ((tr.token != tr.token_prev) != (tr.cause != abi.CAUSE_NONE)) r.uncaused += 1;
+        if (tr.token != tr.token_prev) r.token_changes += 1;
+        if (tr.attention > abi.MASS_FULL) r.over_mass += 1;
+        if (tr.tells & abi.TELL_STARTLE != 0) {
+            r.startles += 1;
+            if (r.first_startle == null) r.first_startle = t;
+        }
+        if (tr.tells & abi.TELL_HESITATE != 0) r.hesitates += 1;
+        if (tr.tells & abi.TELL_FIXATE != 0) r.fixates += 1;
+        // The tell bits on the intent are the trace's, shifted up by four.
+        std.debug.assert((i.flags >> 4) & 0x7 == tr.tells);
+        r.max_grievance = @max(r.max_grievance, mind.grievance);
+        switch (t) {
+            10 => r.arousal_at[0] = mind.arousal,
+            20 => r.arousal_at[1] = mind.arousal,
+            60 => r.arousal_at[2] = mind.arousal,
+            299 => r.arousal_at[3] = mind.arousal,
+            else => {},
+        }
+
+        r.digest = r.digest *% 1099511628211 +% i.action;
+        r.digest = r.digest *% 1099511628211 +% i.target_id;
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.look_x)));
+        r.digest = r.digest *% 1099511628211 +% i.flags;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking_count;
+        r.digest = r.digest *% 1099511628211 +% tr.selected;
+        r.digest = r.digest *% 1099511628211 +% tr.incumbent;
+        r.digest = r.digest *% 1099511628211 +% tr.token;
+        r.digest = r.digest *% 1099511628211 +% tr.cause;
+        r.digest = r.digest *% 1099511628211 +% tr.cause_contact;
+        r.digest = r.digest *% 1099511628211 +% tr.attention;
+        r.digest = r.digest *% 1099511628211 +% tr.tells;
+    }
+    return r;
+}
+
+fn printMind(name: []const u8, r: MindRun) void {
+    std.debug.print(
+        "MIND {s}: digest={d} overrides={d} first={?d} last={?d} unexplained={d} uncaused={d} token_changes={d} startles={d} first_startle={?d} hesitates={d} fixates={d} max_grievance={d} arousal@10/20/60/299={d}/{d}/{d}/{d} attack={d} investigate={d} advance={d} hold={d} flee={d}\n",
+        .{ name, r.digest, r.overrides, r.first_override, r.last_override, r.unexplained, r.uncaused, r.token_changes, r.startles, r.first_startle, r.hesitates, r.fixates, r.max_grievance, r.arousal_at[0], r.arousal_at[1], r.arousal_at[2], r.arousal_at[3], r.actions[abi.ACTION_ATTACK], r.actions[abi.ACTION_INVESTIGATE], r.actions[abi.ACTION_ADVANCE], r.actions[abi.ACTION_HOLD], r.actions[abi.ACTION_FLEE] },
+    );
+}
+
+// MEASURED on 2026-11-14, both arms of each pair, before any number below was pinned.
+// The pairs differ in exactly one input: the grudge control withholds
+// EE_CAP_DAMAGE_EVENTS (so grievance stays at zero), and the flinch control places the
+// same contact at 1.5 instead of 0.61 (so it is not a surprise at close range).
+
+test "MIND: the grudge — commitment override on 37 ticks, and the agent keeps hunting A" {
+    const r = runMind(.grudge, MIND_CAPS, 200);
+    printMind("grudge", r);
+    try std.testing.expectEqual(@as(u32, 37), r.overrides);
+    try std.testing.expectEqual(@as(?u64, 20), r.first_override); // the tick B appears
+    try std.testing.expectEqual(@as(?u64, 56), r.last_override); // the grudge lead's last tick
+    try std.testing.expectEqual(@as(u32, 0), r.unexplained);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u32, 65536), r.max_grievance);
+    try std.testing.expectEqual(@as(u32, 47), r.fixates);
+    try std.testing.expectEqual(@as(u32, 0), r.over_mass);
+    // The same number is asserted by tests/host/null_host.c over the same fixture.
+    try std.testing.expectEqual(@as(u64, 5543746349701543370), r.digest);
+}
+
+test "MIND: the grudge's control — no DAMAGE_EVENTS, no grievance, zero overrides" {
+    const r = runMind(.grudge, MIND_CAPS_NO_DAMAGE, 200);
+    printMind("grudge-control", r);
+    try std.testing.expectEqual(@as(u32, 0), r.overrides);
+    try std.testing.expectEqual(@as(u32, 0), r.max_grievance); // degrade, do not abort
+    try std.testing.expectEqual(@as(u32, 0), r.fixates);
+    try std.testing.expectEqual(@as(u32, 0), r.unexplained);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u64, 7615732920466510316), r.digest);
+}
+
+test "MIND: the flinch — one startle, a bounded hesitation, arousal that decays" {
+    const r = runMind(.flinch, MIND_CAPS, 300);
+    printMind("flinch", r);
+    try std.testing.expectEqual(@as(u32, 1), r.startles);
+    try std.testing.expectEqual(@as(?u64, 10), r.first_startle); // the tick C appears
+    try std.testing.expectEqual(@as(u32, 3), r.hesitates); // HESITATE_TICKS, then it acts
+    try std.testing.expectEqual(@as(u32, 32768), r.arousal_at[0]);
+    try std.testing.expect(r.arousal_at[1] < r.arousal_at[0]); // decays...
+    try std.testing.expectEqual(@as(u32, 0), r.arousal_at[3]); // ...all the way to zero
+    // Arousal lengthens the memory: 39 investigations against the control's 36.
+    try std.testing.expectEqual(@as(u32, 39), r.actions[abi.ACTION_INVESTIGATE]);
+    try std.testing.expectEqual(@as(u32, 0), r.overrides);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u64, 8915218119681936373), r.digest);
+}
+
+test "MIND: the flinch's control — the same contact beyond close range startles nothing" {
+    const r = runMind(.flinch_control, MIND_CAPS, 300);
+    printMind("flinch-control", r);
+    try std.testing.expectEqual(@as(u32, 0), r.startles);
+    try std.testing.expectEqual(@as(u32, 0), r.hesitates);
+    try std.testing.expectEqual(@as(u32, 0), r.arousal_at[0]);
+    try std.testing.expectEqual(@as(u32, 36), r.actions[abi.ACTION_INVESTIGATE]); // EE_MEMORY_TTL
+    try std.testing.expectEqual(@as(u32, 0), r.overrides);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u64, 5970917412374617350), r.digest);
+}
+
+test "MIND: a mind held at rest reproduces 1.0's chase trace exactly" {
+    // The host zeroes the three reservoirs after every tick — the mind's analogue of the
+    // memory-off test above. With no arousal the TTL is 36, with no fear evade scores
+    // as in 1.0, with no grievance there is no grudge lead and the margin is 1.0's, and
+    // the one input this fixture produces (a contradiction when the memory lapses)
+    // cannot cross the startle or hesitation thresholds on its own. So the INTENTS must
+    // be 1.0's, tick for tick, and their digest must be the pinned 1.0 chase digest.
+    var ctx = context(0xEE_0000_0000_0001, 0xFFFF_FFFF, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var digest: u64 = 0;
+    var t: u64 = 0;
+    while (t < 10_000) : (t += 1) {
+        const snap = chaseSnapshot(t, (t % 100) < 30);
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        mind.arousal = 0;
+        mind.fear = 0;
+        mind.grievance = 0;
+        const i = res.intent;
+        digest = digest *% 1099511628211 +% i.action;
+        digest = digest *% 1099511628211 +% i.target_id;
+        digest = digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        digest = digest *% 1099511628211 +% i.flags;
+    }
+    try std.testing.expectEqual(@as(u64, 12283675074724005768), digest);
+}
+
+test "MIND: reservoirs stay in [0, FULL] and drain to zero, even from garbage" {
+    // Abi.Affect proves this of the model; this checks the kernel's arithmetic on the
+    // extremes the model abstracts: u32 garbage in, the largest inputs, and draining.
+    const ks = [_]u5{ 4, 5, 8 };
+    for (ks) |k| {
+        try std.testing.expect(kernel.integrate(0xFFFF_FFFF, 0xFFFF_FFFF, k) <= 65536);
+        try std.testing.expect(kernel.integrate(65536, 65536, k) == 65536);
+        var x: u32 = 65536;
+        var steps: u32 = 0;
+        while (x > 0) : (steps += 1) {
+            const next = kernel.integrate(x, 0, k);
+            try std.testing.expect(next < x); // strictly toward zero with no input
+            x = next;
+        }
+        try std.testing.expect(steps <= 65536);
+    }
+    try std.testing.expectEqual(@as(u32, 36), kernel.ttlFor(0));
+    try std.testing.expectEqual(@as(u32, 68), kernel.ttlFor(65536));
+    try std.testing.expectEqual(@as(u32, 8192), kernel.mindMargin(true, 0)); // = MODE_STICKINESS
+    try std.testing.expectEqual(@as(u32, 8192), kernel.mindMargin(false, 65536));
+    try std.testing.expectEqual(@as(u16, 10000), kernel.massOf(65536));
+    try std.testing.expectEqual(@as(u16, 10000), kernel.massOf(0xFFFF_FFFF));
+}
