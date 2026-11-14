@@ -592,8 +592,8 @@ const AROUSAL_CONTRADICTION: u32 = 16384; // 0.25 when a lead comes to nothing
 // Fear inputs.
 const FEAR_HEALTH_BELOW: i32 = 32768; // 0.5 — below this, health feeds fear
 const FEAR_HEALTH_SHIFT: u5 = 3; // (0.5 - health) / 8 per tick, so at most 4096
-const FEAR_THREATS_FROM: u32 = 3; // three or more visible contacts feed fear
-const FEAR_PER_EXTRA_THREAT: u32 = 1024; // per contact beyond two
+const FEAR_FREE_CONTACTS: u32 = 2; // this many visible contacts cost no fear...
+const FEAR_PER_EXTRA_THREAT: u32 = 1024; // ...and each one beyond them feeds this much
 const FEAR_NO_AMMO: u32 = 2048;
 
 // Grievance input: attributed damage, times four.
@@ -981,7 +981,7 @@ pub fn tickMind(
         const h: i32 = if (snap.health < 0) 0 else snap.health;
         in.low_health = @intCast((FEAR_HEALTH_BELOW - h) >> FEAR_HEALTH_SHIFT);
     }
-    if (count >= FEAR_THREATS_FROM) in.threats = FEAR_PER_EXTRA_THREAT * @as(u32, @intCast(count - 2));
+    if (count > FEAR_FREE_CONTACTS) in.threats = FEAR_PER_EXTRA_THREAT * (@as(u32, @intCast(count)) - FEAR_FREE_CONTACTS);
     if (snap.ammo == 0) in.no_ammo = FEAR_NO_AMMO;
 
     // Grievance belongs to one target. Harm from that target (or with no grudge yet)

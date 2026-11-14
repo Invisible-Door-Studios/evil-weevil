@@ -506,6 +506,96 @@ static struct duel_run run_frightened_duel(void)
     return r;
 }
 
+/* "The crowd" — the fixture that exercises fear (see null_host.zig for the phases):
+ * X (id 41) at 100000 until tick 90 and at 40000 after; health 1.0, then 0.1875 from
+ * 10, 1.0 from 80, 0.244 from 120; three more contacts at 150000 from tick 30; an
+ * empty magazine on 100..109. */
+static ee_snapshot make_crowd_snapshot(uint64_t t)
+{
+    ee_snapshot s = make_snapshot(t);
+    s.health = t < 10u ? EE_FX_ONE : t < 80u ? 12288 : t < 120u ? EE_FX_ONE : 16000;
+    s.ammo = (t >= 100u && t < 110u) ? 0 : (ee_fx)(3 * EE_FX_ONE);
+    memset(&s.contact0, 0, sizeof s.contact0);
+    memset(&s.contact1, 0, sizeof s.contact1);
+    memset(&s.contact2, 0, sizeof s.contact2);
+    memset(&s.contact3, 0, sizeof s.contact3);
+    s.contact0 = mind_contact(41, 0, 16384, 8192, t < 90u ? 100000 : 40000, EE_FX_ONE / 2);
+    s.contact_count = 1;
+    if (t >= 30u) {
+        s.contact1 = mind_contact(42, 0, 8192, 8192, 150000, EE_FX_ONE / 2);
+        s.contact2 = mind_contact(43, 0, 4096, 16384, 150000, EE_FX_ONE / 2);
+        s.contact3 = mind_contact(44, 0, 16384, 4096, 150000, EE_FX_ONE / 2);
+        s.contact_count = 4;
+    }
+    return s;
+}
+
+struct crowd_run { uint64_t digest; unsigned hesitates, reload, attacks_90_119, switches_after_120;
+                   int first_flee, first_flee_after_120; uint32_t fear_at_119; unsigned unexplained, uncaused; };
+
+static struct crowd_run run_crowd(void)
+{
+    struct crowd_run r;
+    memset(&r, 0, sizeof r);
+    r.first_flee = -1;
+    r.first_flee_after_120 = -1;
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_DAMAGE_EVENTS;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+    uint32_t prev = 0;
+    for (uint64_t t = 0; t < 200u; ++t) {
+        ee_snapshot snap = make_crowd_snapshot(t);
+        ee_intent i;
+        ee_mind_trace tr;
+        memset(&tr, 0, sizeof tr);
+        tr.struct_size = (uint32_t)sizeof tr;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &tr) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        if (tr.tells & EE_TELL_HESITATE) r.hesitates++;
+        if (i.action == EE_ACTION_FLEE && r.first_flee < 0) r.first_flee = (int)t;
+        if (i.action == EE_ACTION_RELOAD) r.reload++;
+        if (t >= 90u && t < 120u && i.action == EE_ACTION_ATTACK) r.attacks_90_119++;
+        if (t == 119u) r.fear_at_119 = mind.fear;
+        if (t >= 120u && i.action == EE_ACTION_FLEE && r.first_flee_after_120 < 0) r.first_flee_after_120 = (int)t;
+        if (t > 120u && i.action != prev) r.switches_after_120++;
+        prev = i.action;
+        const uint32_t first = tr.ranking & 0xFu;
+        if (tr.selected != first && tr.selected != tr.incumbent) r.unexplained++;
+        if ((tr.token != tr.token_prev) != (tr.cause != EE_CAUSE_NONE)) r.uncaused++;
+        r.digest = r.digest * 1099511628211ULL + i.action;
+        r.digest = r.digest * 1099511628211ULL + i.target_id;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        r.digest = r.digest * 1099511628211ULL + i.flags;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking;
+        r.digest = r.digest * 1099511628211ULL + tr.selected;
+        r.digest = r.digest * 1099511628211ULL + tr.incumbent;
+        r.digest = r.digest * 1099511628211ULL + tr.token;
+        r.digest = r.digest * 1099511628211ULL + tr.cause;
+        r.digest = r.digest * 1099511628211ULL + tr.attention;
+    }
+    return r;
+}
+
 int main(void)
 {
     /* Layout, as this compiler produced it. The header already asserted these at
@@ -721,6 +811,20 @@ int main(void)
         check(d.digest == 11063771574841757445ULL, "the frightened-duel digest matches the pinned value");
         check(d.switches == 0u && d.flee == 100u, "a frightened agent flees and does not flap");
         check(d.unexplained == 0u && d.uncaused == 0u, "the frightened duel's trace is explained and caused");
+    }
+
+    {
+        const struct crowd_run c = run_crowd();
+        printf("  mind %-15s digest %llu (hesitates=%u first_flee=%d reload=%u flee_after_120=%d fear@119=%u)\n",
+               "crowd", (unsigned long long)c.digest, c.hesitates, c.first_flee, c.reload,
+               c.first_flee_after_120, (unsigned)c.fear_at_119);
+        check(c.digest == 2365169153326385312ULL, "the crowd digest matches the pinned value");
+        check(c.hesitates == 3u && c.first_flee == 13, "flight waits three ticks, then goes");
+        check(c.reload == 10u && c.attacks_90_119 == 20u, "the empty magazine is reloaded mid-engagement");
+        check(c.first_flee_after_120 == 120 && c.switches_after_120 == 0u,
+              "fear breaks the engagement when the wound returns, and the agent stays in flight");
+        check(c.fear_at_119 == 43413u, "fear before the contest is the pinned value");
+        check(c.unexplained == 0u && c.uncaused == 0u, "the crowd's trace is explained and caused");
     }
 
     if (failures) {

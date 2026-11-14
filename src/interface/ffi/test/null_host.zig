@@ -834,3 +834,104 @@ test "MIND: the frightened duel — fear breaks the engagement and the agent doe
     try std.testing.expectEqual(@as(u32, 0), r.uncaused);
     try std.testing.expectEqual(@as(u64, 11063771574841757445), r.digest);
 }
+
+/// "The crowd" — the fixture that exercises fear. Contact X (id 41) is at 100000 (in
+/// flee range, beyond attack and close range) for ticks 0..89 and at 40000 from 90.
+///   0..9     healthy, armed: advance on X
+///   10..29   health 0.1875: wounded with fear still low — flight, after a hesitation
+///            that fear shortens (HESITATE_FEAR_SHIFT)
+///   30..     three more contacts (42..44) at 150000: the threats input
+///   80..119  healthy again; X closes to 40000 at 90 and the agent engages
+///   100..109 empty magazine while engaged and calm enough that the no-ammo input is
+///            not lost in a saturated reservoir: reload, then back to the fight
+///   120..    health 0.244 (wounded): engaged against evade, decided by fear's bonus
+///            (FEAR_EVADE_SHIFT)
+fn crowdSnapshot(t: u64) abi.EeSnapshot {
+    const health: i32 = if (t < 10) FX else if (t < 30) 12288 else if (t < 80) 12288 else if (t < 120) FX else 16000;
+    const ammo: i32 = if (t >= 100 and t < 110) 0 else FX * 3;
+    var s = snapshot(t, 7, health, ammo, 0);
+    s.contact0 = .{ .id = 41, .flags = 0, .bearing_cos = 16384, .bearing_sin = 8192, .distance = if (t < 90) 100000 else 40000, .threat = FX / 2 };
+    var n: u16 = 1;
+    if (t >= 30) {
+        s.contact1 = .{ .id = 42, .flags = 0, .bearing_cos = 8192, .bearing_sin = 8192, .distance = 150000, .threat = FX / 2 };
+        s.contact2 = .{ .id = 43, .flags = 0, .bearing_cos = 4096, .bearing_sin = 16384, .distance = 150000, .threat = FX / 2 };
+        s.contact3 = .{ .id = 44, .flags = 0, .bearing_cos = 16384, .bearing_sin = 4096, .distance = 150000, .threat = FX / 2 };
+        n = 4;
+    }
+    s.contact_count = n;
+    return s;
+}
+
+const CrowdRun = struct {
+    digest: u64 = 0,
+    hesitates: u32 = 0,
+    first_flee: ?u64 = null,
+    reload: u32 = 0,
+    max_fear: u32 = 0,
+    afraid_ticks: u32 = 0,
+    attacks_90_119: u32 = 0, // healthy, X at 40000: the engagement the contest starts from
+    first_flee_after_120: ?u64 = null, // when fear's bonus breaks the engagement
+    fear_at_119: u32 = 0,
+    switches_after_120: u32 = 0,
+    unexplained: u32 = 0,
+    uncaused: u32 = 0,
+};
+
+fn runCrowd(ticks: u64) CrowdRun {
+    var ctx = context(0xEE_0000_0000_0001, MIND_CAPS, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var r = CrowdRun{};
+    var prev: u32 = 0;
+    var t: u64 = 0;
+    while (t < ticks) : (t += 1) {
+        const snap = crowdSnapshot(t);
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        const i = res.intent;
+        const tr = res.trace;
+        if (tr.tells & abi.TELL_HESITATE != 0) r.hesitates += 1;
+        if (i.action == abi.ACTION_FLEE and r.first_flee == null) r.first_flee = t;
+        if (i.action == abi.ACTION_RELOAD) r.reload += 1;
+        if (tr.token == abi.AFFECT_AFRAID) r.afraid_ticks += 1;
+        if (t >= 90 and t < 120 and i.action == abi.ACTION_ATTACK) r.attacks_90_119 += 1;
+        if (t == 119) r.fear_at_119 = mind.fear;
+        if (t >= 120 and i.action == abi.ACTION_FLEE and r.first_flee_after_120 == null) r.first_flee_after_120 = t;
+        if (t > 120 and i.action != prev) r.switches_after_120 += 1;
+        prev = i.action;
+        r.max_fear = @max(r.max_fear, mind.fear);
+        const first: u32 = tr.ranking & 0xF;
+        if (tr.selected != first and tr.selected != tr.incumbent) r.unexplained += 1;
+        if ((tr.token != tr.token_prev) != (tr.cause != abi.CAUSE_NONE)) r.uncaused += 1;
+        r.digest = r.digest *% 1099511628211 +% i.action;
+        r.digest = r.digest *% 1099511628211 +% i.target_id;
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        r.digest = r.digest *% 1099511628211 +% i.flags;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking;
+        r.digest = r.digest *% 1099511628211 +% tr.selected;
+        r.digest = r.digest *% 1099511628211 +% tr.incumbent;
+        r.digest = r.digest *% 1099511628211 +% tr.token;
+        r.digest = r.digest *% 1099511628211 +% tr.cause;
+        r.digest = r.digest *% 1099511628211 +% tr.attention;
+    }
+    return r;
+}
+
+test "MIND: the crowd — every fear input, and both of fear's effects, on one run" {
+    const r = runCrowd(200);
+    std.debug.print("MIND crowd: {any}\n", .{r});
+    // Flight at tick 10 waits three ticks: arousal is high and fear still low.
+    try std.testing.expectEqual(@as(u32, 3), r.hesitates);
+    try std.testing.expectEqual(@as(?u64, 13), r.first_flee);
+    // The empty magazine (100..109) is reloaded through, mid-engagement.
+    try std.testing.expectEqual(@as(u32, 10), r.reload);
+    try std.testing.expectEqual(@as(u32, 20), r.attacks_90_119);
+    // At 120 the wound returns and fear's evade bonus breaks the engagement at once —
+    // and the agent then stays in flight.
+    try std.testing.expectEqual(@as(?u64, 120), r.first_flee_after_120);
+    try std.testing.expectEqual(@as(u32, 0), r.switches_after_120);
+    try std.testing.expectEqual(@as(u32, 43413), r.fear_at_119);
+    try std.testing.expectEqual(@as(u32, 0), r.unexplained);
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused);
+    try std.testing.expectEqual(@as(u64, 2365169153326385312), r.digest);
+}
