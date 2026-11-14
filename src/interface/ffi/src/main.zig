@@ -132,6 +132,47 @@ pub export fn ee_tick(
     return abi.STATUS_OK;
 }
 
+// ── ABI 1.1: the mind (ADR-0013) ─────────────────────────────────────────────
+
+pub export fn ee_mind_fingerprint() u64 {
+    return abi.MIND_FINGERPRINT;
+}
+
+/// One agent, one tick, with a mind. A new entrance rather than a change to `ee_tick`,
+/// so a host that never calls it gets 1.0 behaviour exactly — `ee_tick` above is the
+/// same function it was at 1.0, and its pinned digests are the evidence.
+///
+/// Every argument is validated BEFORE anything is written, so a rejected call leaves the
+/// agent, the mind and the context exactly as they were. `trace` is optional; a host
+/// that passes one states its size, and a size smaller than this ABI's record is refused
+/// rather than overrun.
+pub export fn ee_tick_mind(
+    ctx: ?*abi.EeContext,
+    snap: ?*const abi.EeSnapshot,
+    agent: ?*abi.EeAgent,
+    mind: ?*abi.EeMind,
+    out: ?*abi.EeIntent,
+    trace: ?*abi.EeMindTrace,
+) u32 {
+    const c = ctx orelse return abi.STATUS_BAD_PARAM;
+    const s = snap orelse return abi.STATUS_BAD_PARAM;
+    const a = agent orelse return abi.STATUS_BAD_PARAM;
+    const m = mind orelse return abi.STATUS_BAD_PARAM;
+    const o = out orelse return abi.STATUS_BAD_PARAM;
+
+    if (c.abi_major != abi.ABI_MAJOR) return abi.STATUS_VERSION_MISMATCH;
+    if (m.struct_size < @sizeOf(abi.EeMind)) return abi.STATUS_BUFFER_TOO_SMALL;
+    if (trace) |t| {
+        if (t.struct_size < @sizeOf(abi.EeMindTrace)) return abi.STATUS_BUFFER_TOO_SMALL;
+    }
+
+    var r = kernel.tickMind(c, s, a, m);
+    kernel.degradeForCapabilities(c, &r.intent);
+    o.* = r.intent;
+    if (trace) |t| t.* = r.trace;
+    return abi.STATUS_OK;
+}
+
 // ── Shutdown ────────────────────────────────────────────────────────────────
 
 /// Nothing to free: the kernel owns no memory. Present so a host's teardown path

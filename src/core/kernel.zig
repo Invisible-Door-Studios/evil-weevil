@@ -547,3 +547,626 @@ pub fn degradeForCapabilities(ctx: *const abi.EeContext, intent: *abi.EeIntent) 
         intent.flags |= abi.INTENT_FLAG_UNREACHABLE;
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// ABI 1.1 — THE MIND (ADR-0013, `src/interface/Abi/Affect.idr`)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three affect reservoirs (arousal, fear, grievance), an affect token, three bodily
+// tells (startle, hesitate, fixate), a grievance-widened commitment margin, and a
+// per-tick trace record. Everything above this line is the 1.0 kernel and is NOT
+// touched by this section: `tick` does not call into it, and the four pinned `ee_tick`
+// digests are the evidence (ADR-0006 table).
+//
+// Four rules bind this code, and each one is enforced by construction here, not by a
+// comment:
+//
+//   1. Integer arithmetic only. Every reservoir is a u32 fraction of `FULL`.
+//   2. Affect buys ATTENTION, never belief. A reservoir changes how long a memory is
+//      attended to (`ttlFor`), how readily a commitment is held (`mindMargin`), how
+//      evade ranks (`mindUtility`), and whether the body hesitates or freezes. No
+//      reservoir is ever an argument to a function that writes a bearing, an id or a
+//      position: `rememberSighting` takes perception and nothing else.
+//   3. Scores never leave. The trace carries the RANKING of modes (an order) and the
+//      selected mode; `mindUtility` is private to this file.
+//   4. A token change carries its cause (`causeFor`), and a token that did not change
+//      carries `CAUSE_NONE` — `Abi.Affect.tokenChangeHasCause` proves the pair.
+//
+// The constants are policy, not ABI (ADR-0010 §3): none is in `ee.h`. ADR-0013 lists
+// every one with its measured effect, and the pinned mind digests move if any does.
+
+/// Full scale of a reservoir: 1.0 in Q16.16.
+const FULL: u32 = 65536;
+
+// Leaky integrator shifts: x' = x - ceil(x / 2^k) + input. Half-lives (≈ 0.69 · 2^k):
+const AROUSAL_LEAK_SHIFT: u5 = 5; // ~22 ticks: a startle fades within a second at 60 Hz
+const FEAR_LEAK_SHIFT: u5 = 4; // ~11 ticks: fear tracks the danger, not the memory of it
+const GRIEVANCE_LEAK_SHIFT: u5 = 8; // ~177 ticks: ~5x the 36-tick memory TTL
+
+// Arousal inputs.
+const CLOSE_RANGE: i32 = 65536; // 1.0 — a NEW contact nearer than this is a surprise
+const AROUSAL_CLOSE_CONTACT: u32 = 32768; // 0.5 per surprising appearance
+const AROUSAL_CONTRADICTION: u32 = 16384; // 0.25 when a lead comes to nothing
+// (damage fills arousal one-for-one: a hit of 0.125 health is 0.125 arousal)
+
+// Fear inputs.
+const FEAR_HEALTH_BELOW: i32 = 32768; // 0.5 — below this, health feeds fear
+const FEAR_HEALTH_SHIFT: u5 = 3; // (0.5 - health) / 8 per tick, so at most 4096
+const FEAR_THREATS_FROM: u32 = 3; // three or more visible contacts feed fear
+const FEAR_PER_EXTRA_THREAT: u32 = 1024; // per contact beyond two
+const FEAR_NO_AMMO: u32 = 2048;
+
+// Grievance input: attributed damage, times four.
+const GRIEVANCE_GAIN_SHIFT: u5 = 2;
+
+// The token: the highest reservoir at or above ENTER, the incumbent's reservoir boosted
+// by BAND — the same margin-not-counter hysteresis as the modes (ADR-0012 §3).
+const TOKEN_ENTER: u32 = 16384; // 0.25
+const TOKEN_BAND: u32 = 4096; // 0.0625: exits below 0.1875
+
+// Tells.
+const STARTLE_AROUSAL: u32 = 24576; // 0.375 — crossing it upward on a surprise freezes one tick
+const HESITATE_AROUSAL: u32 = 24576; // hesitation needs arousal at least this high...
+const HESITATE_FEAR_BELOW: u32 = 16384; // ...and fear below this
+const HESITATE_TICKS: u8 = 3; // at most three ticks of delay before a new action
+const HESITATE_FEAR_SHIFT: u5 = 12; // before FLIGHT, fear >> 12 ticks are taken off
+const FIXATE_GRIEVANCE: u32 = 32768; // 0.5 — gaze locks onto the grudge target
+
+// Effects on attention and commitment.
+const AROUSAL_TTL_SHIFT: u5 = 11; // memory lifetime + arousal / 2048: at most +32 ticks
+const FEAR_EVADE_SHIFT: u5 = 4; // evade score + fear / 16: at most +4096, below reload
+const GRIEVANCE_MARGIN_SHIFT: u5 = 2; // pursuit margin + grievance / 4: at most +16384
+
+/// Ceil(x / 2^k) for x > 0, and 0 for 0 — the leak. Rounding UP is what makes a
+/// reservoir with no input reach zero: the brief's `x >> k` floors, and a floored leak
+/// stalls forever at any x < 2^k (a grievance of 255 would widen the margin for the
+/// rest of the game). ADR-0013 records the departure; `Abi.Affect.leakReachesZero`
+/// is the property it buys.
+pub fn leak(x: u32, k: u5) u32 {
+    if (x == 0) return 0;
+    return ((x - 1) >> k) + 1;
+}
+
+/// One step of a leaky integrator, clamped to [0, FULL]. A garbage value written by
+/// the host is clamped on the way in, so the range holds whatever the struct held.
+pub fn integrate(x_in: u32, input: u32, k: u5) u32 {
+    const x = if (x_in > FULL) FULL else x_in;
+    const kept: u64 = x - leak(x, k); // leak(x) <= x, so this cannot wrap
+    const sum = kept + @as(u64, input);
+    return if (sum > FULL) FULL else @intCast(sum);
+}
+
+fn satAdd(a: u32, b: u32) u32 {
+    const s = @as(u64, a) + @as(u64, b);
+    return if (s > FULL) FULL else @intCast(s);
+}
+
+/// Memory lifetime under arousal: 36 at rest, up to 68 at full arousal. With arousal
+/// zero this IS `abi.memory_ttl`, which `Abi.Affect.calmTtlIsTheFrozenTtl` pins.
+pub fn ttlFor(arousal: u32) u32 {
+    const a = if (arousal > FULL) FULL else arousal;
+    return abi.memory_ttl + (a >> AROUSAL_TTL_SHIFT);
+}
+
+/// The incumbent's bonus. With grievance zero, or when the agent is not pursuing its
+/// grudge, it is exactly the 1.0 margin `MODE_STICKINESS` (`Abi.Affect.calmMarginIsTheModesMargin`).
+pub fn mindMargin(pursuing: bool, grievance: u32) u32 {
+    const g = if (grievance > FULL) FULL else grievance;
+    return MODE_STICKINESS + (if (pursuing) g >> GRIEVANCE_MARGIN_SHIFT else 0);
+}
+
+/// Attention mass (enaction ADR-0016: units of 1/10 000) of a reservoir level.
+pub fn massOf(level: u32) u16 {
+    const l: u64 = if (level > FULL) FULL else level;
+    const m = (l * abi.MASS_FULL) >> 16;
+    return @intCast(if (m > abi.MASS_FULL) abi.MASS_FULL else m);
+}
+
+/// The token for three reservoir levels, in declaration order (arousal → WARY,
+/// fear → AFRAID, grievance → ANGRY), given the token the tick opened with.
+pub fn tokenOf(arousal: u32, fear: u32, grievance: u32, prev: u8) u8 {
+    const levels = [3]u32{ arousal, fear, grievance };
+    var best_token: u8 = @intCast(abi.AFFECT_CALM);
+    var best: u32 = 0;
+    for (levels, 0..) |lvl, i| {
+        const tok: u8 = @intCast(i + 1);
+        const sc = lvl + (if (tok == prev) TOKEN_BAND else 0);
+        if (sc > best) {
+            best = sc;
+            best_token = tok;
+        }
+    }
+    return if (best >= TOKEN_ENTER) best_token else @intCast(abi.AFFECT_CALM);
+}
+
+/// The inputs of one tick, by reservoir, in a fixed declared order — the order the
+/// cause is chosen in when two inputs tie.
+const Inputs = struct {
+    close_contact: u32 = 0, // arousal
+    damage: u32 = 0, // arousal
+    contradiction: u32 = 0, // arousal
+    low_health: u32 = 0, // fear
+    threats: u32 = 0, // fear
+    no_ammo: u32 = 0, // fear
+    attributed: u32 = 0, // grievance
+    close_id: u16 = 0,
+    source_id: u16 = 0,
+};
+
+const Cause = struct { code: u8, contact: u16 };
+
+fn largest(comptime n: usize, vals: [n]u32, codes: [n]u8) ?u8 {
+    var best: u32 = 0;
+    var code: ?u8 = null;
+    for (vals, codes) |v, c| {
+        if (v > best) {
+            best = v;
+            code = c;
+        }
+    }
+    return code;
+}
+
+/// Why the token is what it is. NONE exactly when it did not change; otherwise the
+/// largest input this tick to the reservoir the new token names, or DECAY when that
+/// reservoir got no input (it won because another drained) or the new token is calm.
+fn causeFor(prev: u8, now: u8, in: Inputs) Cause {
+    if (prev == now) return .{ .code = @intCast(abi.CAUSE_NONE), .contact = 0 };
+    const decay = Cause{ .code = @intCast(abi.CAUSE_DECAY), .contact = 0 };
+    const code: ?u8 = switch (now) {
+        abi.AFFECT_WARY => largest(3, .{ in.close_contact, in.damage, in.contradiction }, .{
+            @intCast(abi.CAUSE_CLOSE_CONTACT), @intCast(abi.CAUSE_DAMAGE), @intCast(abi.CAUSE_CONTRADICTION),
+        }),
+        abi.AFFECT_AFRAID => largest(3, .{ in.low_health, in.threats, in.no_ammo }, .{
+            @intCast(abi.CAUSE_LOW_HEALTH), @intCast(abi.CAUSE_THREATS), @intCast(abi.CAUSE_NO_AMMO),
+        }),
+        abi.AFFECT_ANGRY => if (in.attributed > 0) @as(u8, @intCast(abi.CAUSE_ATTRIBUTED_DAMAGE)) else null,
+        else => null,
+    };
+    const c = code orelse return decay;
+    const contact: u16 = switch (c) {
+        abi.CAUSE_CLOSE_CONTACT => in.close_id,
+        abi.CAUSE_DAMAGE, abi.CAUSE_ATTRIBUTED_DAMAGE => in.source_id,
+        else => 0,
+    };
+    return .{ .code = c, .contact = contact };
+}
+
+fn contactsOf(snap: *const abi.EeSnapshot) [8]abi.EeContact {
+    return .{
+        snap.contact0, snap.contact1, snap.contact2, snap.contact3,
+        snap.contact4, snap.contact5, snap.contact6, snap.contact7,
+    };
+}
+
+fn visibleCount(snap: *const abi.EeSnapshot) usize {
+    return if (snap.contact_count > 8) 8 else snap.contact_count;
+}
+
+fn seenId(mind: *const abi.EeMind, i: usize) u16 {
+    const word = if (i < 4) mind.seen_ids_lo else mind.seen_ids_hi;
+    return @truncate(word >> @intCast(16 * (i % 4)));
+}
+
+fn wasSeen(mind: *const abi.EeMind, id: u16) bool {
+    const n: usize = if (mind.seen_count > 8) 8 else mind.seen_count;
+    var i: usize = 0;
+    while (i < n) : (i += 1) if (seenId(mind, i) == id) return true;
+    return false;
+}
+
+/// A lead the INVESTIGATE candidate can follow: the grudge slot or the 1.0 memory.
+const Lead = struct { id: u32, x: i32, y: i32 };
+
+/// One mode candidate's score in the mind. Equal to the 1.0 `utilityOf` when fear is
+/// zero and the lead is exactly 1.0's (nothing visible, memory fresh) — which is the
+/// whole of the mind's footprint on the graph when it is calm and holds no grudge.
+fn mindUtility(action: u32, snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32) u32 {
+    return switch (action) {
+        abi.ACTION_RELOAD => if (snap.ammo == 0) UTILITY_RELOAD else 0,
+        abi.ACTION_FLEE => if (near) |n|
+            (if (snap.health < WOUNDED_BELOW and n.distance < FLEE_RANGE)
+                UTILITY_FLEE + (@min(fear, FULL) >> FEAR_EVADE_SHIFT)
+            else
+                0)
+        else
+            0,
+        abi.ACTION_ATTACK => if (near) |n|
+            (if (n.distance <= ATTACK_RANGE) UTILITY_ATTACK else 0)
+        else
+            0,
+        abi.ACTION_INVESTIGATE => if (lead != null) UTILITY_INVESTIGATE else 0,
+        abi.ACTION_ADVANCE => if (near != null)
+            UTILITY_ADVANCE
+        else if (lead != null)
+            0
+        else
+            UTILITY_ADVANCE,
+        else => 0,
+    };
+}
+
+fn mindCandidates(near: ?Nearest, lead: ?Lead) []const u32 {
+    if (near == null and lead != null) return &[_]u32{abi.ACTION_INVESTIGATE};
+    return &CANDIDATES;
+}
+
+/// The ranking: mode candidates by score, highest first, ties in candidate order.
+/// HOLD is not a mode and is not ranked (`enaction-mind-trace/1` candidates are modes).
+const Ranking = struct { packed_modes: u32, count: u8, first: u32 };
+
+fn rankModes(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32) Ranking {
+    var modes: [5]u32 = undefined;
+    var scores: [5]u32 = undefined;
+    var n: usize = 0;
+    for (mindCandidates(near, lead)) |a| {
+        if (a == abi.ACTION_HOLD) continue;
+        const sc = mindUtility(a, snap, near, lead, fear);
+        // Stable insertion: a later candidate passes an earlier one only if STRICTLY
+        // greater, so equal scores stay in candidate order.
+        var j: usize = n;
+        while (j > 0 and scores[j - 1] < sc) : (j -= 1) {
+            modes[j] = modes[j - 1];
+            scores[j] = scores[j - 1];
+        }
+        modes[j] = modeForAction(a);
+        scores[j] = sc;
+        n += 1;
+    }
+    var p: u32 = 0;
+    for (modes[0..n], 0..) |m, i| p |= m << @intCast(4 * i);
+    return .{ .packed_modes = p, .count = @intCast(n), .first = modes[0] };
+}
+
+fn chooseMind(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32, incumbent: u32, margin: u32) u32 {
+    var best_action: u32 = abi.ACTION_HOLD;
+    var best_score: u32 = 0;
+    for (mindCandidates(near, lead)) |a| {
+        var sc = mindUtility(a, snap, near, lead, fear);
+        if (modeForAction(a) == incumbent) sc += margin;
+        if (sc > best_score) {
+            best_score = sc;
+            best_action = a;
+        }
+    }
+    return best_action;
+}
+
+fn mindDecision(action: u32, near: ?Nearest, lead: ?Lead) Decision {
+    return switch (action) {
+        abi.ACTION_RELOAD => .{ .action = action, .target = 0, .priority = UTILITY_RELOAD, .speed = 0, .move_x = 0, .move_y = 0, .look_x = 0, .look_y = 0 },
+        abi.ACTION_FLEE => blk: {
+            const n = near.?;
+            break :blk .{ .action = action, .target = n.id, .priority = UTILITY_FLEE, .speed = 2 * abi.FX_ONE, .move_x = -@as(i32, n.bearing_cos), .move_y = -@as(i32, n.bearing_sin), .look_x = n.bearing_cos, .look_y = n.bearing_sin };
+        },
+        abi.ACTION_ATTACK => blk: {
+            const n = near.?;
+            break :blk .{ .action = action, .target = n.id, .priority = UTILITY_ATTACK, .speed = 0, .move_x = -@as(i32, n.bearing_cos), .move_y = -@as(i32, n.bearing_sin), .look_x = n.bearing_cos, .look_y = n.bearing_sin };
+        },
+        abi.ACTION_INVESTIGATE => blk: {
+            const l = lead.?;
+            break :blk .{ .action = action, .target = l.id, .priority = UTILITY_INVESTIGATE, .speed = abi.FX_ONE, .move_x = l.x, .move_y = l.y, .look_x = l.x, .look_y = l.y };
+        },
+        abi.ACTION_ADVANCE => if (near) |n|
+            .{ .action = action, .target = n.id, .priority = UTILITY_ADVANCE, .speed = abi.FX_ONE, .move_x = n.bearing_cos, .move_y = n.bearing_sin, .look_x = n.bearing_cos, .look_y = n.bearing_sin }
+        else
+            .{ .action = action, .target = 0, .priority = UTILITY_ADVANCE, .speed = abi.FX_ONE, .move_x = 0, .move_y = 0, .look_x = 0, .look_y = 0 },
+        else => .{ .action = abi.ACTION_HOLD, .target = 0, .priority = 0, .speed = 0, .move_x = 0, .move_y = 0, .look_x = 0, .look_y = 0 },
+    };
+}
+
+/// How many ticks the body delays a NEW action. Zero unless arousal is high and fear is
+/// low; before flight, fear takes ticks off (fear >> 12, so 0..3 in the band allowed).
+pub fn hesitationFor(action: u32, arousal: u32, fear: u32) u8 {
+    if (arousal < HESITATE_AROUSAL or fear >= HESITATE_FEAR_BELOW) return 0;
+    if (action != abi.ACTION_FLEE) return HESITATE_TICKS;
+    const cut: u32 = fear >> HESITATE_FEAR_SHIFT;
+    return if (cut >= HESITATE_TICKS) 0 else HESITATE_TICKS - @as(u8, @intCast(cut));
+}
+
+/// Perception writes the grudge slot: the bearing it SAW, age zero. This is the only
+/// function that writes `grudge_x`/`grudge_y`, and it takes no reservoir.
+fn rememberSighting(mind: *abi.EeMind, c: abi.EeContact) void {
+    mind.grudge_x = c.bearing_cos;
+    mind.grudge_y = c.bearing_sin;
+    mind.grudge_age = 0;
+    mind.flags |= @intCast(abi.MIND_FLAG_GRUDGE_LEAD);
+}
+
+fn forgetGrudgeLead(mind: *abi.EeMind) void {
+    mind.flags &= ~@as(u8, @intCast(abi.MIND_FLAG_GRUDGE_LEAD));
+    mind.grudge_x = 0;
+    mind.grudge_y = 0;
+    mind.grudge_age = 0;
+}
+
+/// What one mind tick produced, besides the writes into the caller-owned structs.
+pub const MindResult = struct { intent: abi.EeIntent, trace: abi.EeMindTrace };
+
+/// One tick with a mind. Pure in the same sense as `tick`: a function of (context,
+/// snapshot, agent, mind), writing only into the agent and the mind the caller owns.
+pub fn tickMind(
+    ctx: *abi.EeContext,
+    snap: *const abi.EeSnapshot,
+    agent: *abi.EeAgent,
+    mind: *abi.EeMind,
+) MindResult {
+    const wanted = workUnits(snap);
+    const budget = ctx.budget_units;
+    const used: u32 = if (wanted > budget) budget else wanted;
+    const degraded: bool = wanted > budget;
+    _ = rngNext(&agent.rng_state); // the stream stays a function of tick count alone
+
+    const near = nearestContact(snap);
+    const contacts = contactsOf(snap);
+    const count = visibleCount(snap);
+    const primed = (mind.flags & abi.MIND_FLAG_PRIMED) != 0;
+
+    // Reservoirs as the tick opened, clamped against a host that wrote garbage.
+    const arousal0 = @min(mind.arousal, FULL);
+    const fear0 = @min(mind.fear, FULL);
+    const grievance0 = @min(mind.grievance, FULL);
+    const token0: u8 = if (mind.token > abi.AFFECT_ANGRY) @intCast(abi.AFFECT_CALM) else mind.token;
+    const ttl = ttlFor(arousal0); // attention: how long a lead is followed
+
+    // ── Appraisal: what this tick's snapshot means, as inputs ─────────────────
+    var in = Inputs{};
+
+    // Damage is the drop in health since the last mind tick. Not on the first tick:
+    // with no baseline there is nothing to have dropped from.
+    if (primed and mind.last_health > snap.health) {
+        const d: i64 = @as(i64, mind.last_health) - @as(i64, snap.health);
+        in.damage = if (d > FULL) FULL else @intCast(d);
+    }
+
+    // Attribution needs the capability, damage, and a contact the host flagged.
+    var source: ?abi.EeContact = null;
+    if (in.damage > 0 and hasCapability(ctx, abi.CAP_DAMAGE_EVENTS)) {
+        for (contacts[0..count]) |c| {
+            if ((c.flags & abi.CONTACT_FLAG_DAMAGE_SOURCE) != 0) {
+                source = c;
+                break;
+            }
+        }
+    }
+    if (source) |s| in.source_id = s.id;
+
+    // A NEW contact at close range: the nearest one not visible last tick.
+    var surprise: ?abi.EeContact = null;
+    if (primed) {
+        for (contacts[0..count]) |c| {
+            if (c.distance < CLOSE_RANGE and !wasSeen(mind, c.id)) {
+                if (surprise == null or c.distance < surprise.?.distance) surprise = c;
+            }
+        }
+    }
+    if (surprise) |s| {
+        in.close_contact = AROUSAL_CLOSE_CONTACT;
+        in.close_id = s.id;
+    }
+
+    // The grudge target, if visible this tick.
+    const has_grudge = grievance0 > 0;
+    var grudge_seen: ?abi.EeContact = null;
+    if (has_grudge) {
+        for (contacts[0..count]) |c| {
+            if (c.id == mind.grudge_id) {
+                grudge_seen = c;
+                break;
+            }
+        }
+    }
+
+    // A contradiction: a lead reaches the end of its lifetime with nothing found — the
+    // agent went where the target was and the target was not there. (Memory is a
+    // bearing, not a position, so "arrived" is "followed it for its whole lifetime".)
+    const mem_valid = (agent.flags & abi.AGENT_FLAG_MEMORY_VALID) != 0;
+    const mem_ends = near == null and mem_valid and agent.memory_age +% 1 >= ttl;
+    const grudge_lead_valid = (mind.flags & abi.MIND_FLAG_GRUDGE_LEAD) != 0;
+    const grudge_ends = has_grudge and grudge_seen == null and grudge_lead_valid and mind.grudge_age +% 1 >= ttl;
+    if (mem_ends or grudge_ends) in.contradiction = AROUSAL_CONTRADICTION;
+
+    if (snap.health < FEAR_HEALTH_BELOW) {
+        const h: i32 = if (snap.health < 0) 0 else snap.health;
+        in.low_health = @intCast((FEAR_HEALTH_BELOW - h) >> FEAR_HEALTH_SHIFT);
+    }
+    if (count >= FEAR_THREATS_FROM) in.threats = FEAR_PER_EXTRA_THREAT * @as(u32, @intCast(count - 2));
+    if (snap.ammo == 0) in.no_ammo = FEAR_NO_AMMO;
+
+    // Grievance belongs to one target. Harm from that target (or with no grudge yet)
+    // feeds it; harm from another target transfers the grudge only if it outweighs it.
+    var grievance_base = grievance0;
+    var grudge_id = mind.grudge_id;
+    if (source) |s| {
+        const g_in: u32 = @intCast(@min(@as(u64, in.damage) << GRIEVANCE_GAIN_SHIFT, FULL));
+        if (grievance0 == 0 or s.id == mind.grudge_id) {
+            grudge_id = s.id;
+            in.attributed = g_in;
+        } else if (g_in > grievance0) {
+            grudge_id = s.id;
+            grievance_base = 0;
+            in.attributed = g_in;
+            forgetGrudgeLead(mind);
+        }
+    }
+
+    // ── Integration ─────────────────────────────────────────────────────────────
+    const arousal = integrate(arousal0, satAdd(satAdd(in.close_contact, in.damage), in.contradiction), AROUSAL_LEAK_SHIFT);
+    const fear = integrate(fear0, satAdd(satAdd(in.low_health, in.threats), in.no_ammo), FEAR_LEAK_SHIFT);
+    const grievance = integrate(grievance_base, in.attributed, GRIEVANCE_LEAK_SHIFT);
+    if (grievance == 0) {
+        grudge_id = 0;
+        forgetGrudgeLead(mind);
+    }
+
+    const token = tokenOf(arousal, fear, grievance, token0);
+    const cause = causeFor(token0, token, in);
+    const attention = massOf(@max(arousal, @max(fear, grievance)));
+
+    // ── Perception of the grudge target, BEFORE the decision ───────────────────
+    // A sighting is perception, so it is current: the lead the agent hunts with is
+    // the bearing it sees now if it sees the target at all.
+    if (grievance > 0) {
+        if (source) |s| {
+            if (s.id == grudge_id) rememberSighting(mind, s);
+        }
+        for (contacts[0..count]) |c| {
+            if (c.id == grudge_id) {
+                rememberSighting(mind, c);
+                break;
+            }
+        }
+    }
+    const grudge_visible_now = grievance > 0 and blk: {
+        for (contacts[0..count]) |c| if (c.id == grudge_id) break :blk true;
+        break :blk false;
+    };
+    const grudge_lead_fresh = grievance > 0 and (mind.flags & abi.MIND_FLAG_GRUDGE_LEAD) != 0 and mind.grudge_age < ttl;
+
+    // ── Conation: the lead, the margin, the choice, the ranking ────────────────
+    const mem_fresh = mem_valid and agent.memory_age < ttl;
+    var lead: ?Lead = null;
+    if (grudge_lead_fresh and (near == null or near.?.id != grudge_id)) {
+        lead = .{ .id = grudge_id, .x = mind.grudge_x, .y = mind.grudge_y };
+    } else if (near == null and mem_fresh) {
+        lead = .{ .id = agent.cached_target, .x = agent.memory_x, .y = agent.memory_y };
+    }
+
+    const incumbent = modeOf(agent);
+    const pursuing = incumbent == abi.AGENT_MODE_INVESTIGATE and grievance > 0 and
+        agent.cached_target == grudge_id;
+    const margin = mindMargin(pursuing, grievance);
+    const action = chooseMind(snap, near, lead, fear, incumbent, margin);
+    const ranking = rankModes(snap, near, lead, fear);
+    const d = mindDecision(action, near, lead);
+
+    // ── The body: tells change the motor output, never the decision ────────────
+    var tells: u8 = 0;
+    var out_action = d.action;
+    var speed = d.speed;
+    var move_x = d.move_x;
+    var move_y = d.move_y;
+    var look_x = d.look_x;
+    var look_y = d.look_y;
+    var acts = true;
+
+    const startle = arousal0 < STARTLE_AROUSAL and arousal >= STARTLE_AROUSAL and
+        (in.close_contact > 0 or in.contradiction > 0);
+    if (startle) {
+        tells |= @intCast(abi.TELL_STARTLE);
+        acts = false;
+        out_action = abi.ACTION_HOLD;
+        speed = 0;
+        move_x = 0;
+        move_y = 0;
+        if (surprise) |s| {
+            look_x = s.bearing_cos; // the look snaps to what startled it
+            look_y = s.bearing_sin;
+        }
+    } else {
+        const is_new = d.action != agent.cached_action;
+        if (is_new and (mind.flags & abi.MIND_FLAG_HESITATED) == 0) {
+            mind.hesitate_left = hesitationFor(d.action, arousal, fear);
+            mind.flags |= @intCast(abi.MIND_FLAG_HESITATED);
+        }
+        if (is_new and mind.hesitate_left > 0) {
+            mind.hesitate_left -= 1;
+            tells |= @intCast(abi.TELL_HESITATE);
+            acts = false;
+            out_action = abi.ACTION_HOLD;
+            speed = 0;
+            move_x = 0;
+            move_y = 0;
+        }
+    }
+    if (acts) {
+        mind.flags &= ~@as(u8, @intCast(abi.MIND_FLAG_HESITATED));
+        mind.hesitate_left = 0;
+    }
+    if (grievance >= FIXATE_GRIEVANCE and grudge_lead_fresh) {
+        tells |= @intCast(abi.TELL_FIXATE);
+        look_x = mind.grudge_x;
+        look_y = mind.grudge_y;
+    }
+
+    // ── Bookkeeping: perception writes memory; affect only set its lifetime ─────
+    if (near) |n| {
+        agent.memory_x = @as(i32, n.bearing_cos);
+        agent.memory_y = @as(i32, n.bearing_sin);
+        agent.memory_age = 0;
+        agent.flags |= abi.AGENT_FLAG_MEMORY_VALID;
+    } else if (mem_valid) {
+        if (agent.memory_age +% 1 < ttl) agent.memory_age +%= 1 else forget(agent);
+    }
+    if (grievance > 0 and !grudge_visible_now and (mind.flags & abi.MIND_FLAG_GRUDGE_LEAD) != 0) {
+        if (mind.grudge_age +% 1 < ttl) mind.grudge_age +%= 1 else forgetGrudgeLead(mind);
+    }
+
+    var lo: u64 = 0;
+    var hi: u64 = 0;
+    for (contacts[0..count], 0..) |c, i| {
+        const sh: u6 = @intCast(16 * (i % 4));
+        if (i < 4) lo |= @as(u64, c.id) << sh else hi |= @as(u64, c.id) << sh;
+    }
+    mind.seen_ids_lo = lo;
+    mind.seen_ids_hi = hi;
+    mind.seen_count = @intCast(count);
+    mind.last_health = snap.health;
+    mind.flags |= @intCast(abi.MIND_FLAG_PRIMED);
+    mind.arousal = arousal;
+    mind.fear = fear;
+    mind.grievance = grievance;
+    mind.grudge_id = grudge_id;
+    mind.token = token;
+    mind.reserved0 = 0;
+
+    var flags: u32 = 0;
+    if (degraded) flags |= abi.INTENT_FLAG_DEGRADED;
+    if (agent.cached_target != d.target) flags |= abi.INTENT_FLAG_NEW_TARGET;
+    if (out_action == abi.ACTION_INVESTIGATE) flags |= abi.INTENT_FLAG_FROM_MEMORY;
+    flags |= @as(u32, tells) << 4;
+
+    agent.tick_last = snap.tick;
+    if (acts) {
+        setMode(agent, modeForAction(d.action));
+        agent.cached_action = d.action;
+        agent.cached_target = d.target;
+    }
+    agent.budget_used = used;
+    if (degraded) agent.degraded_ticks +%= 1;
+    ctx.ticks_run +%= 1;
+    if (degraded) ctx.degraded_ticks +%= 1;
+
+    return .{
+        .intent = .{
+            .action = out_action,
+            .target_id = d.target,
+            .move_x = move_x,
+            .move_y = move_y,
+            .move_z = 0,
+            .look_x = look_x,
+            .look_y = look_y,
+            .speed = speed,
+            .priority = d.priority,
+            .budget_used = used,
+            .flags = flags,
+            .reserved0 = 0,
+        },
+        .trace = .{
+            .struct_size = @sizeOf(abi.EeMindTrace),
+            .target_id = d.target,
+            .tick = snap.tick,
+            .ranking = ranking.packed_modes,
+            .attention = attention,
+            .cause_contact = cause.contact,
+            .ranking_count = ranking.count,
+            .selected = @intCast(modeForAction(d.action)),
+            .incumbent = @intCast(incumbent),
+            .token = token,
+            .token_prev = token0,
+            .cause = cause.code,
+            .tells = tells,
+            .reserved0 = 0,
+        },
+    };
+}
