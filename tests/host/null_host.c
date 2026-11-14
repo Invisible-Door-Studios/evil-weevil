@@ -292,6 +292,310 @@ static uint64_t run_flap_trace(uint64_t seed, ee_context *ctx_out,
     return digest;
 }
 
+/* ── ABI 1.1: the mind (ADR-0013) ─────────────────────────────────────────────
+ *
+ * The same four fixtures as src/interface/ffi/test/null_host.zig, through the
+ * exported ee_tick_mind, with the same digest. Commitment override is DERIVED here
+ * from the trace's ranking, incumbent and selected mode — the kernel does not
+ * assert it, exactly as enaction-mind-trace/1 requires of a reader. */
+
+enum mind_fixture { GRUDGE, FLINCH, FLINCH_CONTROL };
+
+static ee_contact mind_contact(uint16_t id, uint16_t flags, uint16_t c, uint16_t sn,
+                               ee_fx distance, ee_fx threat)
+{
+    ee_contact k;
+    memset(&k, 0, sizeof k);
+    k.id = id;
+    k.flags = flags;
+    k.bearing_cos = c;
+    k.bearing_sin = sn;
+    k.distance = distance;
+    k.threat = threat;
+    return k;
+}
+
+/* "The grudge": A (id 21) at 100000 hits the agent on ticks 10..12 and leaves at 13;
+ * B (id 22) appears at 40000 — nearer, in attack range, a lower threat — at tick 20. */
+static ee_snapshot make_grudge_snapshot(uint64_t t)
+{
+    ee_snapshot s = make_snapshot(t);
+    s.health = t < 10u ? EE_FX_ONE : t == 10u ? 57344 : t == 11u ? 49152 : 40960;
+    s.ammo = (ee_fx)(3 * EE_FX_ONE);
+    memset(&s.contact0, 0, sizeof s.contact0);
+    memset(&s.contact1, 0, sizeof s.contact1);
+    uint16_t n = 0;
+    if (t < 13u) {
+        const uint16_t fl = (t >= 10u && t <= 12u) ? (uint16_t)EE_CONTACT_FLAG_DAMAGE_SOURCE : 0u;
+        s.contact0 = mind_contact(21, fl, 16384, 8192, 100000, EE_FX_ONE / 2);
+        n++;
+    }
+    if (t >= 20u) {
+        ee_contact b = mind_contact(22, 0, 8192, 16384, 40000, EE_FX_ONE / 8);
+        if (n == 0) s.contact0 = b; else s.contact1 = b;
+        n++;
+    }
+    s.contact_count = n;
+    return s;
+}
+
+/* "The flinch": C (id 31) visible on ticks 10..19 at `distance`; 40000 is a surprise
+ * at close range, the control's 98304 is not. */
+static ee_snapshot make_flinch_snapshot(uint64_t t, ee_fx distance)
+{
+    ee_snapshot s = make_snapshot(t);
+    s.health = EE_FX_ONE;
+    s.ammo = (ee_fx)(3 * EE_FX_ONE);
+    memset(&s.contact0, 0, sizeof s.contact0);
+    memset(&s.contact1, 0, sizeof s.contact1);
+    memset(&s.contact2, 0, sizeof s.contact2);
+    memset(&s.contact3, 0, sizeof s.contact3);
+    s.contact_count = 0;
+    if (t >= 10u && t < 20u) {
+        s.contact0 = mind_contact(31, 0, 16384, 8192, distance, EE_FX_ONE / 2);
+        s.contact_count = 1;
+    }
+    return s;
+}
+
+struct mind_run {
+    uint64_t digest;
+    unsigned overrides, unexplained, uncaused, startles, hesitates, fixates, over_mass;
+    unsigned investigate;
+    uint32_t max_grievance;
+};
+
+static struct mind_run run_mind(enum mind_fixture fx, uint32_t caps, uint64_t ticks)
+{
+    struct mind_run r;
+    memset(&r, 0, sizeof r);
+
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = caps;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    check(ee_mind_fingerprint() == EE_MIND_FINGERPRINT, "the exported mind fingerprint matches the header");
+
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+
+    for (uint64_t t = 0; t < ticks; ++t) {
+        ee_snapshot snap = fx == GRUDGE ? make_grudge_snapshot(t)
+                         : fx == FLINCH ? make_flinch_snapshot(t, 40000)
+                                        : make_flinch_snapshot(t, 98304);
+        ee_intent i;
+        ee_mind_trace tr;
+        memset(&i, 0, sizeof i);
+        memset(&tr, 0, sizeof tr);
+        tr.struct_size = (uint32_t)sizeof tr;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &tr) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        const uint32_t first = tr.ranking & 0xFu;
+        if (tr.selected == tr.incumbent && tr.selected != first) r.overrides++;
+        if (tr.selected != first && tr.selected != tr.incumbent) r.unexplained++;
+        if ((tr.token != tr.token_prev) != (tr.cause != EE_CAUSE_NONE)) r.uncaused++;
+        if (tr.attention > EE_MASS_FULL) r.over_mass++;
+        if (tr.tells & EE_TELL_STARTLE) r.startles++;
+        if (tr.tells & EE_TELL_HESITATE) r.hesitates++;
+        if (tr.tells & EE_TELL_FIXATE) r.fixates++;
+        if (((i.flags >> 4) & 0x7u) != tr.tells) failures++;
+        if (i.action == EE_ACTION_INVESTIGATE) r.investigate++;
+        if (mind.grievance > r.max_grievance) r.max_grievance = mind.grievance;
+
+        r.digest = r.digest * 1099511628211ULL + i.action;
+        r.digest = r.digest * 1099511628211ULL + i.target_id;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.look_x;
+        r.digest = r.digest * 1099511628211ULL + i.flags;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking_count;
+        r.digest = r.digest * 1099511628211ULL + tr.selected;
+        r.digest = r.digest * 1099511628211ULL + tr.incumbent;
+        r.digest = r.digest * 1099511628211ULL + tr.token;
+        r.digest = r.digest * 1099511628211ULL + tr.cause;
+        r.digest = r.digest * 1099511628211ULL + tr.cause_contact;
+        r.digest = r.digest * 1099511628211ULL + tr.attention;
+        r.digest = r.digest * 1099511628211ULL + tr.tells;
+    }
+    return r;
+}
+
+static void print_mind(const char *name, const struct mind_run *r)
+{
+    printf("  mind %-15s digest %llu (overrides=%u startles=%u hesitates=%u fixates=%u investigate=%u max_grievance=%u)\n",
+           name, (unsigned long long)r->digest, r->overrides, r->startles, r->hesitates,
+           r->fixates, r->investigate, (unsigned)r->max_grievance);
+}
+
+/* "The frightened duel": the 1.0 wounded duel (pinned under ee_tick at
+ * 5191914376283395890) through ee_tick_mind. Low health fills fear; fear raises evade
+ * AND widens the wound threshold, so the agent flees and keeps fleeing. MEASURED with
+ * the bonus alone: 75 switches in 100 ticks. With the widening: zero. */
+struct duel_run { uint64_t digest; unsigned flee, switches, unexplained, uncaused; };
+
+static struct duel_run run_frightened_duel(void)
+{
+    struct duel_run r;
+    memset(&r, 0, sizeof r);
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_DAMAGE_EVENTS;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+    uint32_t prev = 0;
+    for (uint64_t t = 0; t < 100u; ++t) {
+        ee_snapshot snap = make_flap_snapshot(t);
+        ee_intent i;
+        ee_mind_trace tr;
+        memset(&tr, 0, sizeof tr);
+        tr.struct_size = (uint32_t)sizeof tr;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &tr) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        if (i.action == EE_ACTION_FLEE) r.flee++;
+        if (t > 0 && prev != i.action) r.switches++;
+        prev = i.action;
+        const uint32_t first = tr.ranking & 0xFu;
+        if (tr.selected != first && tr.selected != tr.incumbent) r.unexplained++;
+        if ((tr.token != tr.token_prev) != (tr.cause != EE_CAUSE_NONE)) r.uncaused++;
+        r.digest = r.digest * 1099511628211ULL + i.action;
+        r.digest = r.digest * 1099511628211ULL + i.target_id;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        r.digest = r.digest * 1099511628211ULL + i.flags;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking;
+        r.digest = r.digest * 1099511628211ULL + tr.selected;
+        r.digest = r.digest * 1099511628211ULL + tr.incumbent;
+        r.digest = r.digest * 1099511628211ULL + tr.token;
+        r.digest = r.digest * 1099511628211ULL + tr.cause;
+        r.digest = r.digest * 1099511628211ULL + tr.attention;
+    }
+    return r;
+}
+
+/* "The crowd" — the fixture that exercises fear (see null_host.zig for the phases):
+ * X (id 41) at 100000 until tick 90 and at 40000 after; health 1.0, then 0.1875 from
+ * 10, 1.0 from 80, 0.244 from 120; three more contacts at 150000 from tick 30; an
+ * empty magazine on 100..109. */
+static ee_snapshot make_crowd_snapshot(uint64_t t)
+{
+    ee_snapshot s = make_snapshot(t);
+    s.health = t < 10u ? EE_FX_ONE : t < 80u ? 12288 : t < 120u ? EE_FX_ONE : 16000;
+    s.ammo = (t >= 100u && t < 110u) ? 0 : (ee_fx)(3 * EE_FX_ONE);
+    memset(&s.contact0, 0, sizeof s.contact0);
+    memset(&s.contact1, 0, sizeof s.contact1);
+    memset(&s.contact2, 0, sizeof s.contact2);
+    memset(&s.contact3, 0, sizeof s.contact3);
+    s.contact0 = mind_contact(41, 0, 16384, 8192, t < 90u ? 100000 : 40000, EE_FX_ONE / 2);
+    s.contact_count = 1;
+    if (t >= 30u) {
+        s.contact1 = mind_contact(42, 0, 8192, 8192, 150000, EE_FX_ONE / 2);
+        s.contact2 = mind_contact(43, 0, 4096, 16384, 150000, EE_FX_ONE / 2);
+        s.contact3 = mind_contact(44, 0, 16384, 4096, 150000, EE_FX_ONE / 2);
+        s.contact_count = 4;
+    }
+    return s;
+}
+
+struct crowd_run { uint64_t digest; unsigned hesitates, reload, attacks_90_119, switches_after_120;
+                   int first_flee, first_flee_after_120; uint32_t fear_at_119; unsigned unexplained, uncaused; };
+
+static struct crowd_run run_crowd(void)
+{
+    struct crowd_run r;
+    memset(&r, 0, sizeof r);
+    r.first_flee = -1;
+    r.first_flee_after_120 = -1;
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_DAMAGE_EVENTS;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+    uint32_t prev = 0;
+    for (uint64_t t = 0; t < 200u; ++t) {
+        ee_snapshot snap = make_crowd_snapshot(t);
+        ee_intent i;
+        ee_mind_trace tr;
+        memset(&tr, 0, sizeof tr);
+        tr.struct_size = (uint32_t)sizeof tr;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &tr) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        if (tr.tells & EE_TELL_HESITATE) r.hesitates++;
+        if (i.action == EE_ACTION_FLEE && r.first_flee < 0) r.first_flee = (int)t;
+        if (i.action == EE_ACTION_RELOAD) r.reload++;
+        if (t >= 90u && t < 120u && i.action == EE_ACTION_ATTACK) r.attacks_90_119++;
+        if (t == 119u) r.fear_at_119 = mind.fear;
+        if (t >= 120u && i.action == EE_ACTION_FLEE && r.first_flee_after_120 < 0) r.first_flee_after_120 = (int)t;
+        if (t > 120u && i.action != prev) r.switches_after_120++;
+        prev = i.action;
+        const uint32_t first = tr.ranking & 0xFu;
+        if (tr.selected != first && tr.selected != tr.incumbent) r.unexplained++;
+        if ((tr.token != tr.token_prev) != (tr.cause != EE_CAUSE_NONE)) r.uncaused++;
+        r.digest = r.digest * 1099511628211ULL + i.action;
+        r.digest = r.digest * 1099511628211ULL + i.target_id;
+        r.digest = r.digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        r.digest = r.digest * 1099511628211ULL + i.flags;
+        r.digest = r.digest * 1099511628211ULL + tr.ranking;
+        r.digest = r.digest * 1099511628211ULL + tr.selected;
+        r.digest = r.digest * 1099511628211ULL + tr.incumbent;
+        r.digest = r.digest * 1099511628211ULL + tr.token;
+        r.digest = r.digest * 1099511628211ULL + tr.cause;
+        r.digest = r.digest * 1099511628211ULL + tr.attention;
+    }
+    return r;
+}
+
 int main(void)
 {
     /* Layout, as this compiler produced it. The header already asserted these at
@@ -464,6 +768,63 @@ int main(void)
         printf("  actions in 200 ticks: reload=%u advance=%u attack=%u flee=%u hold=%u investigate=%u\n",
                seen[EE_ACTION_RELOAD], seen[EE_ACTION_ADVANCE], seen[EE_ACTION_ATTACK],
                seen[EE_ACTION_FLEE], seen[EE_ACTION_HOLD], seen[EE_ACTION_INVESTIGATE]);
+    }
+
+    /* ABI 1.1: the mind. Four fixtures, four pinned digests shared with the Zig host,
+     * and the two measured override counts the slice is judged on. */
+    {
+        const uint32_t caps = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_DAMAGE_EVENTS;
+        const uint32_t caps_no_damage = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT;
+        const struct mind_run g = run_mind(GRUDGE, caps, 200u);
+        const struct mind_run gc = run_mind(GRUDGE, caps_no_damage, 200u);
+        const struct mind_run f = run_mind(FLINCH, caps, 300u);
+        const struct mind_run fc = run_mind(FLINCH_CONTROL, caps, 300u);
+        print_mind("grudge", &g);
+        print_mind("grudge-control", &gc);
+        print_mind("flinch", &f);
+        print_mind("flinch-control", &fc);
+
+        check(g.digest == 5543746349701543370ULL, "the grudge digest matches the pinned value");
+        check(gc.digest == 7615732920466510316ULL, "the grudge-control digest matches the pinned value");
+        check(f.digest == 8915218119681936373ULL, "the flinch digest matches the pinned value");
+        check(fc.digest == 5970917412374617350ULL, "the flinch-control digest matches the pinned value");
+
+        check(g.overrides == 37u, "the grudge shows commitment override on 37 ticks");
+        check(gc.overrides == 0u, "its control, without DAMAGE_EVENTS, shows none");
+        check(gc.max_grievance == 0u, "without DAMAGE_EVENTS grievance stays at zero");
+        check(f.startles == 1u && f.hesitates == 3u, "the flinch startles once and hesitates three ticks");
+        check(fc.startles == 0u && fc.hesitates == 0u, "its control shows no tell");
+        check(f.investigate == 39u && fc.investigate == 36u,
+              "arousal lengthens the memory: 39 investigations against the control's 36");
+        check(g.unexplained + gc.unexplained + f.unexplained + fc.unexplained == 0u,
+              "every selection is first in the ranking or the incumbent");
+        check(g.uncaused + gc.uncaused + f.uncaused + fc.uncaused == 0u,
+              "every token change has a cause, and no unchanged token has one");
+        check(g.over_mass + gc.over_mass + f.over_mass + fc.over_mass == 0u,
+              "attention never exceeds full mass");
+    }
+
+    {
+        const struct duel_run d = run_frightened_duel();
+        printf("  mind %-15s digest %llu (flee=%u switches=%u)\n", "frightened-duel",
+               (unsigned long long)d.digest, d.flee, d.switches);
+        check(d.digest == 11063771574841757445ULL, "the frightened-duel digest matches the pinned value");
+        check(d.switches == 0u && d.flee == 100u, "a frightened agent flees and does not flap");
+        check(d.unexplained == 0u && d.uncaused == 0u, "the frightened duel's trace is explained and caused");
+    }
+
+    {
+        const struct crowd_run c = run_crowd();
+        printf("  mind %-15s digest %llu (hesitates=%u first_flee=%d reload=%u flee_after_120=%d fear@119=%u)\n",
+               "crowd", (unsigned long long)c.digest, c.hesitates, c.first_flee, c.reload,
+               c.first_flee_after_120, (unsigned)c.fear_at_119);
+        check(c.digest == 2365169153326385312ULL, "the crowd digest matches the pinned value");
+        check(c.hesitates == 3u && c.first_flee == 13, "flight waits three ticks, then goes");
+        check(c.reload == 10u && c.attacks_90_119 == 20u, "the empty magazine is reloaded mid-engagement");
+        check(c.first_flee_after_120 == 120 && c.switches_after_120 == 0u,
+              "fear breaks the engagement when the wound returns, and the agent stays in flight");
+        check(c.fear_at_119 == 43413u, "fear before the contest is the pinned value");
+        check(c.unexplained == 0u && c.uncaused == 0u, "the crowd's trace is explained and caused");
     }
 
     if (failures) {

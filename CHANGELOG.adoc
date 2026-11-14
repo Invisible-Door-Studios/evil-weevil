@@ -10,6 +10,14 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 ==== Added
 
+* ABI 1.1, mind slice 1 (ADR-0013, Proposed): `ee_tick_mind`, a new entrance
+  beside an unchanged `ee_tick`, with caller-owned `ee_mind` state and an
+  `ee_mind_trace` record. Three integer affect reservoirs (arousal, fear,
+  grievance), an affect token with its cause, a grievance-widened commitment
+  margin, and three bodily tells (startle, hesitate, fixate) as `ee_intent.flags`
+  bits 4..6. Specified and proved in `src/interface/Abi/Affect.idr`; six new
+  fixtures pinned by both null hosts. The four `ee_tick` digests and
+  `EE_ABI_FINGERPRINT` (18276775) are unchanged.
 * `www/` site-operations bundle (issue #53): canonical `.well-known/`
   metadata, publishable content, policy sources, error bodies,
   security-header templates, Caddy/nginx/Apache integration examples, an

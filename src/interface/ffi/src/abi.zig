@@ -78,6 +78,34 @@ pub const AGENT_MODE_EVADE = layout.AGENT_MODE_EVADE;
 pub const AGENT_MODE_RELOAD = layout.AGENT_MODE_RELOAD;
 pub const AGENT_MODE_INVESTIGATE = layout.AGENT_MODE_INVESTIGATE;
 
+// ABI 1.1 (ADR-0013): the names of the mind, re-exported from the generated file for
+// the same reason as everything above — the kernel never retypes a bit or a code.
+pub const MIND_FINGERPRINT = layout.mind_fingerprint;
+pub const INTENT_FLAG_STARTLE = layout.INTENT_FLAG_STARTLE;
+pub const INTENT_FLAG_HESITATE = layout.INTENT_FLAG_HESITATE;
+pub const INTENT_FLAG_FIXATE = layout.INTENT_FLAG_FIXATE;
+pub const CONTACT_FLAG_DAMAGE_SOURCE = layout.CONTACT_FLAG_DAMAGE_SOURCE;
+pub const TELL_STARTLE = layout.TELL_STARTLE;
+pub const TELL_HESITATE = layout.TELL_HESITATE;
+pub const TELL_FIXATE = layout.TELL_FIXATE;
+pub const MIND_FLAG_PRIMED = layout.MIND_FLAG_PRIMED;
+pub const MIND_FLAG_GRUDGE_LEAD = layout.MIND_FLAG_GRUDGE_LEAD;
+pub const MIND_FLAG_HESITATED = layout.MIND_FLAG_HESITATED;
+pub const AFFECT_CALM = layout.AFFECT_CALM;
+pub const AFFECT_WARY = layout.AFFECT_WARY;
+pub const AFFECT_AFRAID = layout.AFFECT_AFRAID;
+pub const AFFECT_ANGRY = layout.AFFECT_ANGRY;
+pub const CAUSE_NONE = layout.CAUSE_NONE;
+pub const CAUSE_CLOSE_CONTACT = layout.CAUSE_CLOSE_CONTACT;
+pub const CAUSE_DAMAGE = layout.CAUSE_DAMAGE;
+pub const CAUSE_CONTRADICTION = layout.CAUSE_CONTRADICTION;
+pub const CAUSE_LOW_HEALTH = layout.CAUSE_LOW_HEALTH;
+pub const CAUSE_THREATS = layout.CAUSE_THREATS;
+pub const CAUSE_NO_AMMO = layout.CAUSE_NO_AMMO;
+pub const CAUSE_ATTRIBUTED_DAMAGE = layout.CAUSE_ATTRIBUTED_DAMAGE;
+pub const CAUSE_DECAY = layout.CAUSE_DECAY;
+pub const MASS_FULL = layout.MASS_FULL;
+
 // ── The ABI structs ─────────────────────────────────────────────────────────
 // `extern struct` gives C layout. Field order and types mirror Abi.Types exactly.
 
@@ -181,6 +209,45 @@ pub const EeContext = extern struct {
     degraded_ticks: u64,
 };
 
+// ABI 1.1 (ADR-0013). Caller-owned per-agent mind state, and the per-tick trace
+// record. Both carry `struct_size` at offset 0, checked on every `ee_tick_mind` call.
+
+pub const EeMind = extern struct {
+    struct_size: u32,
+    arousal: u32,
+    seen_ids_lo: u64,
+    seen_ids_hi: u64,
+    fear: u32,
+    grievance: u32,
+    last_health: EeFx,
+    grudge_x: EeFx,
+    grudge_y: EeFx,
+    grudge_age: u32,
+    grudge_id: u16,
+    seen_count: u16,
+    token: u8,
+    hesitate_left: u8,
+    flags: u8,
+    reserved0: u8,
+};
+
+pub const EeMindTrace = extern struct {
+    struct_size: u32,
+    target_id: u32,
+    tick: u64,
+    ranking: u32,
+    attention: u16,
+    cause_contact: u16,
+    ranking_count: u8,
+    selected: u8,
+    incumbent: u8,
+    token: u8,
+    token_prev: u8,
+    cause: u8,
+    tells: u8,
+    reserved0: u8,
+};
+
 // ── The comptime gate ───────────────────────────────────────────────────────
 // One helper, called once per field. If any of these fires, the Zig struct no
 // longer matches the ABI that Idris2 proved and the C compiler asserted — which
@@ -277,4 +344,40 @@ comptime {
     assertOffset(EeContext, "tick_rate_den", layout.offset_ee_context_tick_rate_den, "ee_context.tick_rate_den");
     assertOffset(EeContext, "ticks_run", layout.offset_ee_context_ticks_run, "ee_context.ticks_run");
     assertOffset(EeContext, "degraded_ticks", layout.offset_ee_context_degraded_ticks, "ee_context.degraded_ticks");
+
+    // ABI 1.1 — every field, not a sample: these structs are new, so nothing older
+    // than this file has checked them.
+    assertSize(EeMind, layout.sizeof_ee_mind, "ee_mind");
+    assertOffset(EeMind, "struct_size", layout.offset_ee_mind_struct_size, "ee_mind.struct_size");
+    assertOffset(EeMind, "arousal", layout.offset_ee_mind_arousal, "ee_mind.arousal");
+    assertOffset(EeMind, "seen_ids_lo", layout.offset_ee_mind_seen_ids_lo, "ee_mind.seen_ids_lo");
+    assertOffset(EeMind, "seen_ids_hi", layout.offset_ee_mind_seen_ids_hi, "ee_mind.seen_ids_hi");
+    assertOffset(EeMind, "fear", layout.offset_ee_mind_fear, "ee_mind.fear");
+    assertOffset(EeMind, "grievance", layout.offset_ee_mind_grievance, "ee_mind.grievance");
+    assertOffset(EeMind, "last_health", layout.offset_ee_mind_last_health, "ee_mind.last_health");
+    assertOffset(EeMind, "grudge_x", layout.offset_ee_mind_grudge_x, "ee_mind.grudge_x");
+    assertOffset(EeMind, "grudge_y", layout.offset_ee_mind_grudge_y, "ee_mind.grudge_y");
+    assertOffset(EeMind, "grudge_age", layout.offset_ee_mind_grudge_age, "ee_mind.grudge_age");
+    assertOffset(EeMind, "grudge_id", layout.offset_ee_mind_grudge_id, "ee_mind.grudge_id");
+    assertOffset(EeMind, "seen_count", layout.offset_ee_mind_seen_count, "ee_mind.seen_count");
+    assertOffset(EeMind, "token", layout.offset_ee_mind_token, "ee_mind.token");
+    assertOffset(EeMind, "hesitate_left", layout.offset_ee_mind_hesitate_left, "ee_mind.hesitate_left");
+    assertOffset(EeMind, "flags", layout.offset_ee_mind_flags, "ee_mind.flags");
+    assertOffset(EeMind, "reserved0", layout.offset_ee_mind_reserved0, "ee_mind.reserved0");
+
+    assertSize(EeMindTrace, layout.sizeof_ee_mind_trace, "ee_mind_trace");
+    assertOffset(EeMindTrace, "struct_size", layout.offset_ee_mind_trace_struct_size, "ee_mind_trace.struct_size");
+    assertOffset(EeMindTrace, "target_id", layout.offset_ee_mind_trace_target_id, "ee_mind_trace.target_id");
+    assertOffset(EeMindTrace, "tick", layout.offset_ee_mind_trace_tick, "ee_mind_trace.tick");
+    assertOffset(EeMindTrace, "ranking", layout.offset_ee_mind_trace_ranking, "ee_mind_trace.ranking");
+    assertOffset(EeMindTrace, "attention", layout.offset_ee_mind_trace_attention, "ee_mind_trace.attention");
+    assertOffset(EeMindTrace, "cause_contact", layout.offset_ee_mind_trace_cause_contact, "ee_mind_trace.cause_contact");
+    assertOffset(EeMindTrace, "ranking_count", layout.offset_ee_mind_trace_ranking_count, "ee_mind_trace.ranking_count");
+    assertOffset(EeMindTrace, "selected", layout.offset_ee_mind_trace_selected, "ee_mind_trace.selected");
+    assertOffset(EeMindTrace, "incumbent", layout.offset_ee_mind_trace_incumbent, "ee_mind_trace.incumbent");
+    assertOffset(EeMindTrace, "token", layout.offset_ee_mind_trace_token, "ee_mind_trace.token");
+    assertOffset(EeMindTrace, "token_prev", layout.offset_ee_mind_trace_token_prev, "ee_mind_trace.token_prev");
+    assertOffset(EeMindTrace, "cause", layout.offset_ee_mind_trace_cause, "ee_mind_trace.cause");
+    assertOffset(EeMindTrace, "tells", layout.offset_ee_mind_trace_tells, "ee_mind_trace.tells");
+    assertOffset(EeMindTrace, "reserved0", layout.offset_ee_mind_trace_reserved0, "ee_mind_trace.reserved0");
 }

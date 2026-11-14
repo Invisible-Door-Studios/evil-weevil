@@ -167,3 +167,83 @@ test "shutdown is safe on a null pointer and clears the run counters" {
     ee.ee_shutdown(&ctx);
     try std.testing.expectEqual(@as(u64, 0), ctx.ticks_run);
 }
+
+// ── ABI 1.1: the mind entrance (ADR-0013) ───────────────────────────────────
+
+fn zeroMind() abi.EeMind {
+    var m = std.mem.zeroes(abi.EeMind);
+    m.struct_size = @sizeOf(abi.EeMind);
+    return m;
+}
+
+fn zeroTrace() abi.EeMindTrace {
+    var t = std.mem.zeroes(abi.EeMindTrace);
+    t.struct_size = @sizeOf(abi.EeMindTrace);
+    return t;
+}
+
+test "1.1: version_info reports minor 1, and the 1.0 fingerprint did not move" {
+    const v = ee.ee_version_info();
+    try std.testing.expectEqual(@as(u16, 1), v.major);
+    try std.testing.expectEqual(@as(u16, 1), v.minor);
+    // A 1.0 host compiled 18276775 into its binary; ee_init must still accept it.
+    try std.testing.expectEqual(@as(u64, 18276775), ee.ee_abi_fingerprint());
+    var desc = zeroDesc();
+    desc.abi_minor = 0;
+    desc.abi_fingerprint = 18276775;
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    try std.testing.expectEqual(abi.MIND_FINGERPRINT, ee.ee_mind_fingerprint());
+}
+
+test "1.1: tick_mind answers, writes a trace, and accepts a NULL trace" {
+    var desc = zeroDesc();
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    var snap = zeroSnapshot();
+    var agent = zeroAgent();
+    var mind = zeroMind();
+    var out = std.mem.zeroes(abi.EeIntent);
+    var trace = zeroTrace();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, &trace));
+    try std.testing.expectEqual(abi.ACTION_ATTACK, out.action);
+    try std.testing.expectEqual(@as(u8, @intCast(abi.AGENT_MODE_ENGAGE)), trace.selected);
+    try std.testing.expect(trace.ranking_count == 5);
+    try std.testing.expect(mind.flags & abi.MIND_FLAG_PRIMED != 0);
+    snap.tick = 1;
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, null));
+    try std.testing.expectEqual(@as(u64, 2), ctx.ticks_run);
+}
+
+test "1.1: tick_mind refuses bad arguments and short structs, and writes nothing" {
+    var desc = zeroDesc();
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    var snap = zeroSnapshot();
+    var agent = zeroAgent();
+    var mind = zeroMind();
+    var out = std.mem.zeroes(abi.EeIntent);
+    var trace = zeroTrace();
+
+    try std.testing.expectEqual(abi.STATUS_BAD_PARAM, ee.ee_tick_mind(null, &snap, &agent, &mind, &out, &trace));
+    try std.testing.expectEqual(abi.STATUS_BAD_PARAM, ee.ee_tick_mind(&ctx, null, &agent, &mind, &out, &trace));
+    try std.testing.expectEqual(abi.STATUS_BAD_PARAM, ee.ee_tick_mind(&ctx, &snap, null, &mind, &out, &trace));
+    try std.testing.expectEqual(abi.STATUS_BAD_PARAM, ee.ee_tick_mind(&ctx, &snap, &agent, null, &out, &trace));
+    try std.testing.expectEqual(abi.STATUS_BAD_PARAM, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, null, &trace));
+
+    // A zeroed mind has not declared its size: refused, not trusted.
+    var unsized = std.mem.zeroes(abi.EeMind);
+    try std.testing.expectEqual(abi.STATUS_BUFFER_TOO_SMALL, ee.ee_tick_mind(&ctx, &snap, &agent, &unsized, &out, &trace));
+    var short_trace = zeroTrace();
+    short_trace.struct_size = 8;
+    try std.testing.expectEqual(abi.STATUS_BUFFER_TOO_SMALL, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, &short_trace));
+
+    // Nothing was written by any refusal.
+    try std.testing.expectEqual(@as(u64, 0), ctx.ticks_run);
+    try std.testing.expectEqual(@as(u8, 0), mind.flags);
+    try std.testing.expectEqual(@as(u64, 0), agent.rng_state);
+    try std.testing.expectEqual(@as(u64, 0), short_trace.tick);
+
+    var uninit = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_VERSION_MISMATCH, ee.ee_tick_mind(&uninit, &snap, &agent, &mind, &out, &trace));
+}

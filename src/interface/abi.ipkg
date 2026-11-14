@@ -42,3 +42,4 @@ modules = Abi.Types
         , Abi.Memory
         , Abi.Utility
         , Abi.Modes
+        , Abi.Affect

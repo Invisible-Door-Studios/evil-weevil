@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell (metadatastician) <j.d.a.jewell@open.ac.uk>
+= Architecture Decision Record: 0013-affect-and-volition
+
+== 13. Affect and volition: mind slice 1, as an additive ABI 1.1
+
+Date: 2026-11-14
+
+=== Status
+
+Proposed. Implemented in the same change; the owner's acceptance is outstanding.
+Nothing here is accepted until the owner says so. Sections 9 and 10 list what is
+deliberately left to the owner.
+
+=== Context
+
+The owner ruled on 2026-11-14 that Evil Weevil is the first host of the estate's
+cognition, affect and conation contract. The first deterministic affect and conation
+code lives in this kernel (the Enaction Engine route plan `WEEVIL-HOST-ROUTE`, package
+A3). The Enaction Engine owns the contract, `enaction-mind-trace/1`; this kernel
+conforms to that contract as DATA.
+
+The licence boundary decides the shape of the work. This kernel is MPL-2.0 and its
+`AGENTIC` record denies AGPL. The Enaction Engine is AGPL. So no Enaction source enters
+this repository: the mind is implemented here, in integer Zig, from the contract's
+prose rules. The only things read from the sibling repository were its route plan and
+ADRs 0014, 0016 and 0027, as specifications.
+
+Five rules bind the work. They are the contract's, restated where a reviewer can check
+them against this code:
+
+. Integer and fixed point only. No libm, no float.
+. Affect buys attention, never belief.
+. Utilities never leave the kernel. The trace carries a RANKING and the selection, never
+  a score.
+. A change of affect token carries its cause.
+. `ee_tick` does not change, and its pinned digests must not move. This acceptance test
+  was chosen before the work began, as in ADR-0010.
+
+=== Decision
+
+==== 1. ABI 1.1 is additive (ADR-0005 §5)
+
+* *A new entrance, `ee_tick_mind`*, beside `ee_tick`. Its signature is
+  `(ctx, snap, agent, mind, out, trace)`. A host that never calls it gets 1.0
+  exactly. `ee_tick` is the same function it was at 1.0: the diff of
+  `src/core/kernel.zig` touches no line above the `ABI 1.1 — THE MIND` banner.
+* *Two new caller-owned structs*, each with `struct_size` at offset 0. Both are proved
+  in `Abi.Layout` like the seven 1.0 structs, and asserted by the C compiler and by
+  Zig's comptime gate. `ee_tick_mind` refuses a short struct with
+  `EE_STATUS_BUFFER_TOO_SMALL` and refuses a null pointer with `EE_STATUS_BAD_PARAM`
+  (`trace` may be NULL). Every check runs before anything is written.
+* *Bits the freeze left undefined*, following the precedent of ADR-0009 and ADR-0012.
+  `ee_intent.flags` bits 4..6 carry the tells (`EE_INTENT_FLAG_STARTLE` 16,
+  `HESITATE` 32, `FIXATE` 64). They sit above every 1.0 bit, and only `ee_tick_mind`
+  sets them. `ee_contact.flags` bit 0 is `EE_CONTACT_FLAG_DAMAGE_SOURCE`, and only
+  `ee_tick_mind` reads it. No existing field changed meaning, size or offset.
+* *The fingerprint stays 18276775.* `EE_ABI_FINGERPRINT` is now computed over
+  `frozenStructs`, the seven 1.0 structs, and no longer over every emitted struct. A 1.0
+  host compiled the number into its binary and `ee_init` compares against it.
+  Covering the new structs would have made `ee_init` refuse every 1.0 host, which is
+  the opposite of additive. The new structs carry their own fingerprint,
+  `EE_MIND_FINGERPRINT` = 1047490, exported as `ee_mind_fingerprint()`. A boundary
+  test initialises a 1.1 kernel with minor 0 and fingerprint 18276775.
+* `EE_ABI_MINOR` moves from 0 to 1. That is the only changed line in the generated
+  header. Every other line of its diff is an addition.
+
+`ee_mind`, 56 bytes, per agent, owned by the host:
+
+[cols="2,1,1,4",options="header"]
+|===
+| Field | Type | Offset | Meaning
+| struct_size | u32 | 0 | set by the host; checked on every call
+| arousal | u32 | 4 | reservoir, Q16.16 in [0, 65536]
+| seen_ids_lo | u64 | 8 | ids of contacts 0..3 visible last tick, 16 bits each
+| seen_ids_hi | u64 | 16 | ids of contacts 4..7
+| fear | u32 | 24 | reservoir
+| grievance | u32 | 28 | reservoir, for one target
+| last_health | ee_fx | 32 | health at the last mind tick (damage is the drop)
+| grudge_x | ee_fx | 36 | the grudge target's last SEEN bearing (cos)
+| grudge_y | ee_fx | 40 | ... (sin)
+| grudge_age | u32 | 44 | ticks since the grudge target was seen
+| grudge_id | u16 | 48 | the contact the grievance is held against
+| seen_count | u16 | 50 | how many ids the two words hold
+| token | u8 | 52 | the affect token
+| hesitate_left | u8 | 53 | ticks of hesitation still owed
+| flags | u8 | 54 | `EE_MIND_FLAG_PRIMED` 1, `GRUDGE_LEAD` 2, `HESITATED` 4
+| reserved0 | u8 | 55 | written 0
+|===
+
+`ee_mind_trace`, 32 bytes, one record per call when the host passes one:
+
+[cols="2,1,1,4",options="header"]
+|===
+| Field | Type | Offset | Meaning
+| struct_size | u32 | 0 | set by the host; the kernel writes its own size back
+| target_id | u32 | 4 | the decision's target
+| tick | u64 | 8 | the snapshot's tick
+| ranking | u32 | 16 | mode codes, 4 bits each, rank 0 in the low nibble
+| attention | u16 | 20 | a mass in 1/10 000 (enaction ADR-0016): the highest reservoir, quantised
+| cause_contact | u16 | 22 | the contact behind the cause, or 0
+| ranking_count | u8 | 24 | how many nibbles of `ranking` are meaningful (1 or 5)
+| selected | u8 | 25 | the mode selected by the graph and the margin
+| incumbent | u8 | 26 | the mode the tick opened in
+| token | u8 | 27 | `EE_AFFECT_*`
+| token_prev | u8 | 28 | the token the tick opened with
+| cause | u8 | 29 | `EE_CAUSE_*`: NONE exactly when the token did not change
+| tells | u8 | 30 | `EE_TELL_*`: the intent tell bits shifted down by four
+| reserved0 | u8 | 31 | written 0
+|===
+
+The trace deliberately carries no reservoir value and no "override" field. The contract
+keeps continuous affect inside the host (enaction ADR-0027 §4). The mind state is
+host-owned, so a host can read the reservoirs, but they are not part of the trace.
+Commitment override is derived by the reader (ADR-0027 §7). Both null hosts derive it
+from `ranking`, `incumbent` and `selected`, and neither reads a flag the kernel set.
+
+==== 2. Affect buys attention, never belief
+
+What each reservoir is allowed to change, and nothing else:
+
+[cols="1,4",options="header"]
+|===
+| Reservoir | Changes
+| arousal | the tells; the lifetime of a lead, `36 + arousal/2048` ticks (at most 68)
+| fear | evade's score, `+ fear/16` (at most +4096); the wound threshold for fleeing, `0.25 + fear/4` (at most 0.5); hesitation before flight, `- fear/4096` ticks
+| grievance | the commitment margin while the agent pursues its grudge, `+ grievance/4` (at most +16384); the gaze (FIXATE)
+|===
+
+No reservoir is an argument to code that writes a bearing, an id or a position. The
+grudge slot is written by one function, `rememberSighting`, which takes a contact and
+nothing else. `Abi.Affect.sightingIgnoresAffect` proves that what a sighting writes is
+the same whatever the arousal is. `leadNeverInventsABearing` proves that a lead without
+a sighting keeps its bearing or is cleared, and is never given a bearing nobody saw.
+Fear's wound threshold READS health and never rewrites it: it changes how much the agent
+weighs its health, not what it believes the health to be.
+
+==== 3. The reservoirs, and one departure from the brief
+
+Each reservoir is a leaky integrator, clamped: `x' = clamp(x - leak(x) + input)`.
+
+*Departure, stated.* The brief specified `leak(x) = x >> k`. That form FLOORS, and a
+floored leak stalls: any `x < 2^k` has `x >> k = 0`, so it never drains. A grievance
+of 255 would widen the margin for the rest of a game, and "with grievance zero the
+margin is 1.0's" would describe a state the agent never returns to. The shipped leak
+rounds UP: `leak(x) = ((x - 1) >> k) + 1` for `x > 0`, which is `ceil(x / 2^k)`. It is
+still a shift and an add. `Abi.Affect.leakStrictlyShrinks` holds for it and not for the
+floored form: a scratch mutation to the floored form was refused by the type checker.
+This is the more elegant arm and the one recommended. The floored arm is available
+only by accepting a reservoir that never empties.
+
+The kernel also clamps each reservoir on the way IN, against a host that wrote garbage
+into the struct. A Zig test drives `0xFFFFFFFF` through it.
+
+==== 4. Inputs: what the slice needed that 1.0 lacked
+
+* *Damage amount* is the drop in `snapshot.health` since the last mind tick, held in
+  `ee_mind.last_health`. It is not a new snapshot field. Health is already ABI, a drop
+  in it is damage by any reading, and a rise is ignored. There is no damage on the first
+  tick (`EE_MIND_FLAG_PRIMED` is clear), because nothing can have dropped yet.
+* *Damage source* is `EE_CONTACT_FLAG_DAMAGE_SOURCE` on the contact the host
+  attributes the hit to. It is honoured only with `EE_CAP_DAMAGE_EVENTS` and only on
+  a tick with damage. The first flagged contact in published order wins.
+* *Without `EE_CAP_DAMAGE_EVENTS`*, grievance stays at zero: degrade, do not abort.
+  `noCapabilityNoGrievance` proves it of the model, and "the grudge's control" measures
+  it.
+* *One grudge at a time.* Harm from the grudge target, or with no grudge yet, feeds the
+  reservoir. Harm from another contact transfers the grudge only if its input exceeds
+  the current grievance. Otherwise it arouses but does not anger. The route plan's
+  phrase "a grievance reservoir for each remembered target" is NOT implemented. It
+  needs a per-target table this struct does not have, and it is recorded as open in §10.
+* *Surprise* is the nearest contact closer than 1.0 that was not visible last tick.
+* *Contradiction.* This needed a definition the brief did not have. The brief defined a
+  contradiction as "the agent reaches a remembered place and the target is not there".
+  Memory in this kernel is a BEARING, not a position (ADR-0009 §1), so the agent cannot
+  know it has reached anywhere. The shipped definition is the nearest honest one: a lead
+  (the 1.0 memory or the grudge slot) reaches the end of its lifetime with nothing
+  found, so the agent followed it as long as it was willing and the target was not
+  there. When memory stores positions (ADR-0009's successor), this definition should
+  become the brief's.
+
+==== 5. The token, its hysteresis, and its cause
+
+The token is the reservoir with the highest level. The incumbent token's reservoir is
+boosted by the band (4096), the earliest wins among equals, and the result is CALM
+unless it reaches the entry threshold (16384). This is the same margin-not-counter
+hysteresis as the modes (ADR-0012 §3): enter at 0.25, exit below 0.1875. The vocabulary
+is the contract's, in order: calm, wary (arousal), afraid (fear), angry (grievance).
+
+The cause is NONE exactly when the token did not change. Otherwise it is the largest
+input this tick to the reservoir the new token names, ties in declared order. It is
+DECAY when that reservoir got no input (it won because another drained) or when the new
+token is calm. `tokenChangeHasCause` and `tokenKeptHasNoCause` are general theorems.
+Every tick of every mind fixture is also checked in both hosts, and none had an uncaused
+change or a cause without a change.
+
+==== 6. Volition: the ranking, the selection, and commitment override
+
+The ranking orders the five MODES, the contract's candidates. HOLD is not ranked. The
+order is by score, highest first, with ties in tie-break order (reload, evade, engage,
+investigate, advance). When nothing is visible and a lead exists, the ranking is one
+mode, exactly as ADR-0010 §4's singleton.
+
+The investigate candidate follows a LEAD. The lead is the grudge slot if the grudge
+target is remembered and is not the nearest visible contact. Otherwise it is the 1.0
+memory when nothing is visible and the memory is fresh. With grievance zero the first
+case can never arise, so the mind's graph is 1.0's. `calmMindAgreesWithTheGraph` checks
+this against `Abi.Modes.nextMode`. A test also runs the 1.0 chase fixture through
+`ee_tick_mind` with the reservoirs held at zero, and gets the pinned 1.0 chase digest
+12283675074724005768, tick for tick.
+
+The margin is `MODE_STICKINESS` (8192) plus `grievance/4`, and the widening applies
+only while the agent PURSUES its grudge. Pursuing means it is in INVESTIGATE mode with
+the grudge target as its target. With grievance zero the margin is exactly 1.0's
+(`calmMarginIsTheModesMargin`, general).
+
+A tick shows *commitment override* when the selected mode is the incumbent and is not
+first in the ranking. On "the grudge":
+
+* B appears at tick 20, inside attack range, so engage ranks first: 52428 against
+  investigate's 32768.
+* The grudging agent still selects investigate: 32768 + 8192 + 16384 = 57344.
+* It does so until the grudge lead's lifetime ends at tick 56.
+
+What the grudge can NOT hold, by theorem: flight (57344 < 58982,
+`theGrudgeYieldsToFlight`) and reload (57344 < 65536, `theGrudgeYieldsToReload`).
+
+==== 7. The tells
+
+* *STARTLE*: arousal crosses 0.375 upward on a tick with a surprise or a contradiction.
+  The agent freezes for one tick (HOLD, speed 0) and its look snaps to the surprising
+  contact. The decision is still made and traced; the body does not act on it that
+  tick.
+* *HESITATE*: a NEW action, with arousal at least 0.375 and fear below 0.25. The body
+  holds for at most 3 ticks, then acts. Before flight, fear removes `fear/4096` ticks.
+  It is bounded by construction: hesitation is armed once per change of action, and
+  cannot be re-armed until the agent has acted.
+* *FIXATE*: grievance at least 0.5 and the grudge target remembered. The look is set to
+  the grudge bearing, whatever the agent is doing.
+
+During STARTLE and HESITATE the agent's mode and cached action do not change, because
+it has not acted. The trace's `selected` is the conative selection, and the intent's
+action is the body's.
+
+==== 8. The trace and `enaction-mind-trace/1`
+
+`ee_mind_trace` is the kernel's half of the contract document. The host builds the
+document from it, and B1 (IDApTIK) is the first host to do so:
+
+* `affect.token` comes from `token`. `affect.attention` is `attention`, a mass of at
+  most 10 000 (`massInRange`).
+* `affect.caused_by` names EVENTS in the paired runner output. The kernel knows INPUTS
+  (`cause`, `cause_contact`) and not event ids, so the mapping from an input to the
+  host's event id belongs to the host.
+* `conation.ranking`, `incumbent` and `selected` come from the mode nibbles. Mode codes
+  map to the contract's candidates: advance 0, engage 1, evade 2, reload 3,
+  investigate 4.
+* `tells` comes from the trace bits, `target` from `target_id`.
+
+Two contract checks are mirrored in both hosts on every tick of every fixture, with
+zero violations measured: `UnexplainedSelection` (selected is first or the incumbent)
+and `UncausedAffectChange`.
+
+==== 9. The constants, and what each was MEASURED to do
+
+Six fixtures are pinned in both hosts. Each constant below was changed by itself in a
+scratch copy and the fixtures re-run. The "Measured effect" column is that run, not a
+prediction. Every one of the 26 perturbations moved at least one pinned digest, so a
+planted change to any constant fails the gate. The baseline readings are: grudge
+overrides 37 and fixates 47; flinch startles 1, hesitates 3, investigates 39; crowd
+hesitates 3, flees again at 120, reloads 10; frightened duel switches 0.
+
+[cols="3,1,2,5",options="header"]
+|===
+| Constant | Value | Perturbed to | Measured effect (digests moved; readings)
+
+| AROUSAL_LEAK_SHIFT | 5 | 4 / 6 | 5 of 6 digests; grudge overrides 32 / 42, flinch hesitates 3 / 9, flinch investigates 36 / 39
+| FEAR_LEAK_SHIFT | 4 | 5 | crowd, frightened duel
+| GRIEVANCE_LEAK_SHIFT | 8 | 7 / 9 | grudge digest; override count unchanged at 37, because the grudge LEAD's lifetime ends first (tick 56)
+| CLOSE_RANGE | 65536 | 32768 | grudge, grudge control, flinch; flinch startles 0, hesitates 0, investigates 36; grudge overrides 32
+| AROUSAL_CLOSE_CONTACT | 32768 | 16384 | grudge, grudge control, flinch; flinch startles 0; grudge overrides 34
+| AROUSAL_CONTRADICTION | 16384 | 0 | grudge, flinch, flinch control
+| FEAR_HEALTH_BELOW | 32768 | 16384 | crowd, frightened duel (the duel no longer flees: it stays engaged)
+| FEAR_HEALTH_SHIFT | 3 | 4 | crowd, frightened duel
+| FEAR_FREE_CONTACTS | 2 | 3 | crowd
+| FEAR_PER_EXTRA_THREAT | 1024 | 0 | crowd; the engagement breaks at 137 instead of 120
+| FEAR_NO_AMMO | 2048 | 0 | crowd
+| GRIEVANCE_GAIN_SHIFT | 2 | 1 | grudge; overrides 9 (grievance never fills, so the margin drains below the boundary at tick 28)
+| TOKEN_ENTER | 16384 | 24576 | grudge control, flinch, flinch control, frightened duel
+| TOKEN_BAND | 4096 | 0 | crowd, grudge control, flinch, flinch control
+| STARTLE_AROUSAL | 24576 | 40000 | grudge, flinch; flinch startles 0
+| HESITATE_AROUSAL | 24576 | 40000 | grudge, flinch; flinch hesitates 0
+| HESITATE_FEAR_BELOW | 16384 | 0 | 4 of 6; no hesitation anywhere
+| HESITATE_TICKS | 3 | 5 | 4 of 6; hesitations 5 in flinch and crowd
+| HESITATE_FEAR_SHIFT | 12 | 11 | crowd; flight hesitates 2 ticks, not 3
+| FIXATE_GRIEVANCE | 32768 | 60000 | grudge; fixates 24
+| AROUSAL_TTL_SHIFT | 11 | 12 | grudge, flinch; grudge overrides 33, flinch investigates 37
+| FEAR_EVADE_SHIFT | 4 | 5 | crowd; the engagement breaks at 127 instead of 120
+| FEAR_WOUND_SHIFT | 2 | 16 | frightened duel; 75 switches in 100 ticks (the flapping returns)
+| GRIEVANCE_MARGIN_SHIFT | 2 | 3 | grudge; overrides 0
+|===
+
+Three more constants have no row because they are not new: `FULL` (65536, the Q16.16
+unit), `MODE_STICKINESS` (8192, ADR-0012) and the utility weights (ADR-0010). The mind
+reuses them unchanged.
+
+==== 10. The fixtures and their pins
+
+[cols="2,4,2",options="header"]
+|===
+| Fixture | What it shows (measured) | Digest, both hosts
+| the grudge | commitment override on 37 ticks (20..56); grievance fills to 65536; fixate 47 | 5543746349701543370
+| the grudge's control | the same snapshots without `EE_CAP_DAMAGE_EVENTS`: grievance 0, overrides 0 | 7615732920466510316
+| the flinch | one startle at tick 10; 3 hesitations; arousal 32768, then decaying to 0; 39 investigations | 8915218119681936373
+| the flinch's control | the same contact at 1.5 instead of 0.61: no tell, arousal 0 at tick 10, 36 investigations (`EE_MEMORY_TTL`) | 5970917412374617350
+| the frightened duel | the 1.0 wounded duel through the mind: fear breaks the engagement, flee on 100 ticks, 0 switches | 11063771574841757445
+| the crowd | every fear input; hesitation before flight 3; reload 10; fear's evade bonus breaks the engagement at 120 and holds | 2365169153326385312
+|===
+
+The planted control was run before this record was written.
+`AROUSAL_LEAK_SHIFT` was changed from 5 to 6, and `just seam-check` FAILED: 4 mind tests
+failed, 37 of 41 passed, and the four 1.0 tests stayed green. The change was then
+reverted.
+
+=== Consequences
+
+==== Positive
+
+* "Ill will that persists" is a count a test can check: 37 against 0, on two runs that
+  differ by one capability bit.
+* A designer can see why an agent chose, whether it chose from commitment, what changed
+  its mood, and what its body showed — without any score crossing the seam.
+* The 1.0 surface did not move. The four `ee_tick` digests, the fingerprint and every
+  1.0 offset are byte-identical, and a 1.0 host needs no change.
+
+==== Negative
+
+* A finding of the slice: fear re-created the flapping that ADR-0012 removed. With
+  fear only raising evade's score, the wounded duel switched 75 times in 100 ticks,
+  because flight won on every wounded tick and lost on every healed one. The
+  wound-threshold widening fixes it, measured at 0 switches, and is pinned so the
+  flapping cannot return silently. Any later affect that raises a score must be checked
+  the same way.
+* The 1.0 margin lets an EVADING agent keep fleeing on an empty magazine
+  (58982 + 8192 > 65536). This is 1.0 behaviour that the mind does not change, and
+  "the crowd" shows it. An early draft of `Abi.Affect` claimed that no affect could
+  hold against reload. It was corrected to the property that is true: affect's
+  ADDITIONS stay below reload.
+* Constants are duplicated between `Abi.Affect` and the kernel, as the utility weights
+  are (ADR-0010). The instance theorems and the six digests are the tie. A drift that
+  changed neither would be invisible.
+* The budget model is unchanged. The mind's work is not counted in `workUnits`.
+
+==== Neutral
+
+* The mind consumes no randomness. The trace stays seed-independent, as 1.0's is.
+
+=== Left to the owner
+
+* *Acceptance of this record and of ABI 1.1.*
+* *What a host should do with a tell.* The kernel says what the body does: hold, look,
+  delay. It does not say what animation, sound or legibility symbol a tell maps to.
+  That belongs to hosts and games, and is not decided here.
+* *Grievance per target.* The route plan reads "for each remembered target"; this slice
+  holds one grudge per agent, with a transfer rule (§4). A table of grudges would grow
+  `ee_mind`, a 1.2 decision.
+* *Whether an evading agent should reload on an empty magazine.* This is the 1.0
+  margin's behaviour, a policy question older than this slice. It sits beside ADR-0010
+  §6's open question.
+* *Contradiction as arrival.* This waits for memory to store positions (§4).
