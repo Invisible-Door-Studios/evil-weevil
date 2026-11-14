@@ -5,8 +5,8 @@
 ||| The specification of the code below the `ABI 1.1 — THE MIND` line in
 ||| `src/core/kernel.zig`. Three reservoirs (arousal, fear, grievance), an affect token
 ||| with a cause, a commitment margin that grievance widens, and the three bodily tells.
-||| The kernel implements what is written here; four pinned digests per host make a
-||| divergence loud, as for every other module of the seam.
+||| The kernel implements what is written here; six pinned mind digests, asserted by both
+||| null hosts, make a divergence loud, as for every other module of the seam.
 |||
 ||| == The four rules this module exists to make checkable
 |||
@@ -663,8 +663,15 @@ theGrudgeYieldsToReload :
   mindChoose ModeInvestigate (mindMargin True 65536) (MkMind True 40000 False True True 0) = ModeReload
 theGrudgeYieldsToReload = Refl
 
-||| The widest margin and the largest fear bonus both stay below reload, so no affect can
-||| hold a mode against an empty magazine.
+||| What affect ADDS stays below reload: the widest pursuit (investigate plus the 1.0
+||| margin plus the full grievance widening) and the largest fear bonus on evade are both
+||| under 65536, so an investigating agent always reloads and affect never lifts evade
+||| itself above reload.
+|||
+||| NOT claimed: that no mode can hold against an empty magazine. The 1.0 margin already
+||| lets an EVADING agent keep fleeing on an empty magazine (58982 + 8192 = 67174 >
+||| 65536) — 1.0 behaviour, unchanged by this module and measured in "the crowd". An
+||| earlier draft of this comment claimed the stronger property; it was false.
 export
 affectStaysBelowReload :
   ( So (Abi.Utility.scoreInvestigate + Abi.Modes.stickiness + idiv 65536 4 < Abi.Utility.scoreReload)
